@@ -221,6 +221,7 @@ class Metrics:
         self.sample_entropy = torchmetrics.aggregation.MeanMetric()
         self.unique_token_count = 0
         self.tc = TC()
+        self.extra_valid = {}
         self.eval_ppl_batch_size = eval_ppl_batch_size
         self.gen_ppl_eval_model_name_or_path = gen_ppl_eval_model_name_or_path
         self.tokenizer = transformers.AutoTokenizer.\
@@ -236,6 +237,8 @@ class Metrics:
         self.train_aux = self.train_aux.to(*args, **kwargs)
         self.valid_nlls = self.valid_nlls.to(*args, **kwargs)
         self.valid_aux = self.valid_aux.to(*args, **kwargs)
+        for name, metric in self.extra_valid.items():
+            self.extra_valid[name] = metric.to(*args, **kwargs)
 
     def reset(self):
         self.gen_ppl.reset()
@@ -244,14 +247,33 @@ class Metrics:
         self.train_aux.reset()
         self.valid_nlls.reset()
         self.valid_aux.reset()
+        for metric in self.extra_valid.values():
+            metric.reset()
 
     def update_train(self, nll, aux_loss, num_tokens):
         self.train_nlls.update(nll, num_tokens)
         self.train_aux.update(aux_loss, num_tokens)
 
-    def update_valid(self, nll, aux_loss, num_tokens):
+    def _get_or_create_extra_valid_metric(self, name, reference_value):
+        if name not in self.extra_valid:
+            self.extra_valid[name] = NLL().to(
+                device=reference_value.device, dtype=torch.float64)
+        return self.extra_valid[name]
+
+    def update_valid(self, nll, aux_loss, num_tokens, extra_metrics=None):
         self.valid_nlls.update(nll, num_tokens)
         self.valid_aux.update(aux_loss, num_tokens)
+        if extra_metrics is None:
+            return
+        for name, value in extra_metrics.items():
+            self._get_or_create_extra_valid_metric(name, value).update(
+                value, num_tokens)
+
+    def compute_extra_valid(self):
+        return {
+            name: metric.compute()
+            for name, metric in self.extra_valid.items()
+        }
 
     @torch.no_grad()
     def _eval_retokenize(self, text_samples, max_length,

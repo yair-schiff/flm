@@ -29,6 +29,7 @@ class Loss:
     nlls: torch.FloatTensor
     prior_loss: torch.FloatTensor
     num_tokens: torch.FloatTensor
+    extra_metrics: dict[str, torch.FloatTensor] | None = None
 
 
 class LogLinear(torch.nn.Module):
@@ -295,7 +296,7 @@ class TrainerBase(L.LightningModule):
                     pin_memory=self.config.loader.pin_memory,
                     sampler=dl_sampler,
                     shuffle=False,
-                    persistent_workers=True))
+                    persistent_workers=False))
         self.trainer.fit_loop._combined_loader.flattened = updated_dls
 
     def optimizer_step(self, *args, **kwargs):
@@ -346,6 +347,9 @@ class TrainerBase(L.LightningModule):
                  sync_dist=True)
         return losses.loss
 
+    def supports_generative_eval(self):
+        return True
+
     def on_train_epoch_end(self):
         # NOTE:
         # Originally, this method re-logged validation NLL metrics at the end
@@ -375,7 +379,8 @@ class TrainerBase(L.LightningModule):
                             xT=None if 'xT' not in batch else batch['xT']
                             )
         self.metrics.update_valid(losses.nlls, losses.prior_loss,
-                                  losses.num_tokens)
+                                  losses.num_tokens,
+                                  extra_metrics=losses.extra_metrics)
         return losses.loss
 
     def on_validation_epoch_end(self):
@@ -383,9 +388,26 @@ class TrainerBase(L.LightningModule):
         for k, v in self.metrics.valid_nlls.items():
             self.log(name=k,  value=v.compute(), on_step=False,
                      on_epoch=True, sync_dist=True)
+        extra_valid = self.metrics.compute_extra_valid()
+        for k, v in extra_valid.items():
+            self.log(name=f'val/{k}', value=v, on_step=False,
+                     on_epoch=True, sync_dist=True)
+        if 'ce_upper_bound' in extra_valid:
+            ce_bound = extra_valid['ce_upper_bound']
+            self.log(name='val/nll_upper_ce', value=ce_bound,
+                     on_step=False, on_epoch=True, sync_dist=True)
+            self.log(name='val/ppl_upper_ce', value=torch.exp(ce_bound),
+                     on_step=False, on_epoch=True, sync_dist=True)
+        if 'l2_bound' in extra_valid:
+            l2_bound = extra_valid['l2_bound']
+            self.log(name='val/nll_upper_l2', value=l2_bound,
+                     on_step=False, on_epoch=True, sync_dist=True)
+            self.log(name='val/ppl_upper_l2', value=torch.exp(l2_bound),
+                     on_step=False, on_epoch=True, sync_dist=True)
         if ((self.config.eval.compute_perplexity_on_sanity
              or not self.trainer.sanity_checking)
-                and self.config.eval.generate_samples):
+                and self.config.eval.generate_samples
+                and self.supports_generative_eval()):
 
             step_list = self.config.sampling.steps
             if isinstance(step_list, ListConfig):

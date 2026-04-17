@@ -12,3 +12,10 @@ t_max: 1.0
 t_min: 0.0
 double_temb: False
 learnable_loss_weighting: False
+interpolant_type: flm_linear  # flm_linear / vdm_gaussian
+train_loss: native  # native / ce_upper_bound / l2_vdm
+time_reparam: decoding_error_rate  # decoding_error_rate / none
+time_sampling: uniform  # uniform / snr_reweighted
+vdm_schedule: linear_logsnr
+vdm_logsnr_min: -20.0
+vdm_logsnr_max: 20.0

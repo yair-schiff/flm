@@ -1,15 +1,15 @@
 #!/bin/bash
 
-DATA_DIR="YOUR_DATA_DIR"
+DATA_DIR="/share/kuleshov/yzs2/data"
 
 python -u -m main \
-  loader.global_batch_size=512 \
-  loader.batch_size=32 \
+  loader.global_batch_size=8 \
+  loader.batch_size=8 \
   loader.eval_batch_size=32 \
   data=lm1b-wrap \
   data.cache_dir=$DATA_DIR \
   wandb.project=lm1b_full \
-  wandb.name=lm1b_full_flm \
+  wandb.name=lm1b_full_flm_new \
   model=small \
   algo=flm \
   model.length=128 \

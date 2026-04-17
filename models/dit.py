@@ -416,11 +416,13 @@ class DDiTBlockCausal(nn.Module):
 class DDiTBlock(nn.Module):
     def __init__(self, dim, n_heads, adaLN,
                  cond_dim=None, mlp_ratio=4,
-                 dropout=0.1):
+                 dropout=0.1,
+                 attention_backend='flash'):
         super().__init__()
         self.n_heads = n_heads
         self.adaLN = adaLN
-        self.softcap=50
+        self.softcap = 50
+        self.attention_backend = attention_backend
         self.norm1 = LayerNorm(dim)
         self.attn_qkv = nn.Linear(dim, 3 * dim, bias=False)
         self.attn_out = nn.Linear(dim, dim, bias=False)
@@ -455,7 +457,8 @@ class DDiTBlock(nn.Module):
         output = torch.einsum('bhij,bhjd->bhid', attn_probs, v)  # (B, H, S, D)
         return output
     
-    def forward(self, x, rotary_cos_sin=None, c=None, seqlens=None, exclude_last_token=False, use_jvp_attn=False):
+    def forward(self, x, rotary_cos_sin=None, c=None, seqlens=None,
+                exclude_last_token=False, use_jvp_attn=False):
 
         bias_dropout_scale_fn = self._get_bias_dropout_scale()
 
@@ -478,20 +481,38 @@ class DDiTBlock(nn.Module):
             qkv = apply_rotary_pos_emb(
                 qkv, cos.to(qkv.dtype), sin.to(qkv.dtype), use_flash= not use_jvp_attn
             )
-        
-        if use_jvp_attn: #custom attention for JVP support
+
+        if use_jvp_attn:  # custom attention for JVP support
             q, k, v = qkv.unbind(dim=2) 
             q = q.transpose(1, 2)  
             k = k.transpose(1, 2)
             v = v.transpose(1, 2)
-            
+
             x = self.custom_sdpa(q, k, v, softcap=self.softcap)
             x = x.transpose(1, 2)
-        else:
+        elif self.attention_backend == 'flash':
             x = flash_attn.flash_attn_qkvpacked_func(
                 qkv, 0.0, causal=False,
                 softcap=self.softcap,
                 )
+        elif self.attention_backend == 'sdpa':
+            q, k, v = qkv.unbind(dim=2)
+            q = q.transpose(1, 2)
+            k = k.transpose(1, 2)
+            v = v.transpose(1, 2)
+            # Force a real fallback backend for debugging FlashAttention hangs.
+            with sdpa_kernel(SDPBackend.MATH):
+                x = F.scaled_dot_product_attention(
+                    query=q,
+                    key=k,
+                    value=v,
+                    attn_mask=None,
+                    dropout_p=0.0,
+                    is_causal=False)
+            x = x.transpose(1, 2)
+        else:
+            raise ValueError(
+                f'Unsupported attention_backend: {self.attention_backend}')
 
         x = einops.rearrange(x, 'b s h d -> b s (h d)',)
         
@@ -566,6 +587,8 @@ class DIT(nn.Module, huggingface_hub.PyTorchModelHubMixin):
         self.adaLN = not self.causal
         self.config = config
         self.vocab_size = vocab_size
+        self.attention_backend = getattr(
+            config.model, 'attention_backend', 'flash')
         dim = config.model.hidden_size
         cond_dim = config.model.cond_dim
         self.vocab_embed = EmbeddingLayer(dim, vocab_size)
@@ -594,7 +617,8 @@ class DIT(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                     n_heads=config.model.n_heads,
                     cond_dim=cond_dim,
                     adaLN=self.adaLN,
-                    dropout=config.model.dropout)
+                    dropout=config.model.dropout,
+                    attention_backend=self.attention_backend)
             blocks.append(block)
         self.blocks = nn.ModuleList(blocks)
         

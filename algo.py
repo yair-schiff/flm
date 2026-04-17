@@ -788,7 +788,21 @@ class FLMBase(trainer_base.TrainerBase):
         super().__init__(config, tokenizer)
         self.t_min = config.algo.t_min
         self.t_max = config.algo.t_max
-        self.lut_a2g, self.lut_g2a = utils.build_luts(K=self.vocab_size)
+        self.interpolant_type = getattr(
+            config.algo, 'interpolant_type', 'flm_linear')
+        self.train_loss_name = getattr(
+            config.algo, 'train_loss', 'native')
+        self.time_reparam = getattr(
+            config.algo, 'time_reparam', 'decoding_error_rate')
+        self.time_sampling = getattr(
+            config.algo, 'time_sampling', 'uniform')
+        self.vdm_schedule = getattr(
+            config.algo, 'vdm_schedule', 'linear_logsnr')
+        self.vdm_logsnr_min = float(getattr(
+            config.algo, 'vdm_logsnr_min', -20.0))
+        self.vdm_logsnr_max = float(getattr(
+            config.algo, 'vdm_logsnr_max', 20.0))
+        self.lut_a2g, self.lut_g2a = self._build_time_warp_luts()
         self._is_resuming = (
             config.checkpointing.resume_from_ckpt
             and config.checkpointing.resume_ckpt_path is not None
@@ -800,6 +814,78 @@ class FLMBase(trainer_base.TrainerBase):
 
     def training_step(self, batch, batch_idx):
         return super().training_step(batch, batch_idx)
+
+    def supports_generative_eval(self):
+        return self.interpolant_type != 'vdm_gaussian'
+
+    def _build_time_warp_luts(self):
+        if self.time_reparam == 'none':
+            return None, None
+        if self.interpolant_type == 'vdm_gaussian':
+            return utils.build_luts(
+                K=self.vocab_size,
+                margin_fn=self._vdm_margin_np)
+        if self.interpolant_type == 'flm_linear':
+            return utils.build_luts(K=self.vocab_size)
+        raise ValueError(
+            f'Unsupported interpolant_type: {self.interpolant_type}')
+
+    def _sample_unit_interval(self, n, accum_step):
+        if accum_step is not None:
+            batch_dim = n
+            n = self.config.loader.global_batch_size
+        else:
+            batch_dim = n
+        eps = torch.rand(n, device=self.device)
+        if self.antithetic_sampling:
+            offset = torch.arange(n, device=self.device) / n
+            eps = (eps / n + offset) % 1
+            perm = torch.randperm(n, device=self.device)
+            eps = eps[perm]
+        if accum_step is not None:
+            eps = eps.chunk(self.trainer.num_nodes)[self.trainer.node_rank]
+            eps = eps.chunk(self.trainer.num_devices)[self.trainer.local_rank]
+            eps = eps.chunk(self.trainer.accumulate_grad_batches)[accum_step]
+            eps = eps[:batch_dim]
+        return eps[:batch_dim]
+
+    def _vdm_logsnr(self, t):
+        if self.vdm_schedule != 'linear_logsnr':
+            raise ValueError(
+                f'Unsupported vdm_schedule: {self.vdm_schedule}')
+        delta = self.vdm_logsnr_max - self.vdm_logsnr_min
+        return self.vdm_logsnr_min + delta * t
+
+    def _vdm_logsnr_np(self, t):
+        t = np.asarray(t, dtype=np.float64)
+        if self.vdm_schedule != 'linear_logsnr':
+            raise ValueError(
+                f'Unsupported vdm_schedule: {self.vdm_schedule}')
+        delta = self.vdm_logsnr_max - self.vdm_logsnr_min
+        return self.vdm_logsnr_min + delta * t
+
+    def _vdm_margin_np(self, t):
+        return np.exp(0.5 * self._vdm_logsnr_np(t))
+
+    def _vdm_alpha(self, t):
+        return torch.sqrt(torch.sigmoid(self._vdm_logsnr(t)))
+
+    def _vdm_sigma(self, t):
+        return torch.sqrt(torch.sigmoid(-self._vdm_logsnr(t)).clamp_min(1e-12))
+
+    def _vdm_snr(self, t):
+        return torch.exp(self._vdm_logsnr(t))
+
+    def _vdm_snr_prime(self, t):
+        delta = self.vdm_logsnr_max - self.vdm_logsnr_min
+        return delta * self._vdm_snr(t)
+
+    def _cap_logits(self, model_output, cap_value=30.0):
+        return cap_value * torch.tanh(model_output / cap_value)
+
+    def _log_probs_from_logits(self, model_output):
+        model_output = self._cap_logits(model_output)
+        return model_output.log_softmax(dim=-1)
 
     def _process_sigma(self, sigma):
         if sigma.ndim == 1:
@@ -815,7 +901,7 @@ class FLMBase(trainer_base.TrainerBase):
 
     def _process_model_output(self, model_output, xt, sigma, cap_value = 30.0):
         del xt, sigma
-        model_output = cap_value * torch.tanh(model_output / cap_value)
+        model_output = self._cap_logits(model_output, cap_value=cap_value)
         return model_output.log_softmax(dim=-1)
 
     def _process_model_input(self, x0, valid_tokens):
@@ -828,10 +914,16 @@ class FLMBase(trainer_base.TrainerBase):
         """Override to always dispatch to self.loss() for all FLM classes."""
         (input_tokens, output_tokens,
          valid_tokens) = self._process_model_input(x0, valid_tokens)
-        loss = self.loss(input_tokens, output_tokens,
-                         current_accumulation_step, train_mode,
-                         xT=xT, given_t=given_t,
-                         not_sampling_t=not_sampling_t)
+        loss_output = self.loss(input_tokens, output_tokens,
+                                current_accumulation_step, train_mode,
+                                xT=xT, given_t=given_t,
+                                not_sampling_t=not_sampling_t)
+        if isinstance(loss_output, dict):
+            loss = loss_output['loss']
+            extra_metrics = loss_output.get('extra_metrics', {})
+        else:
+            loss = loss_output
+            extra_metrics = {}
         assert loss.ndim == 2
         if self.ignore_bos:
             loss[:, 1:] = loss[:, 1:]
@@ -840,10 +932,16 @@ class FLMBase(trainer_base.TrainerBase):
         nlls = (loss * valid_tokens).sum()
         num_tokens = valid_tokens.sum()
         token_nll = nlls / num_tokens
+        extra_metric_sums = None
+        if extra_metrics:
+            extra_metric_sums = {}
+            for name, value in extra_metrics.items():
+                extra_metric_sums[name] = (value * valid_tokens).sum()
         return trainer_base.Loss(loss=token_nll,
                                  nlls=nlls,
                                  prior_loss=0.0,
-                                 num_tokens=num_tokens)
+                                 num_tokens=num_tokens,
+                                 extra_metrics=extra_metric_sums)
 
     def loss(self, x0, output_tokens,
              current_accumulation_step=None, train_mode=False,
@@ -854,42 +952,82 @@ class FLMBase(trainer_base.TrainerBase):
             current_accumulation_step=None, train_mode=False):
         raise NotImplementedError
 
-    def _sample_t_interval(self, n, accum_step, t_min=None, t_max=None):
+    def _sample_tau_interval(self, n, accum_step, t_min=None, t_max=None):
         if t_min is None:
             t_min = self.t_min
         if t_max is None:
             t_max = self.t_max
-        if accum_step is not None:
-            batch_dim = n
-            n = self.config.loader.global_batch_size
-        _eps_t = torch.rand(n, device=self.device)
-        if self.antithetic_sampling:
-            offset = torch.arange(n, device=self.device) / n
-            _eps_t = (_eps_t / n + offset) % 1
-            perm = torch.randperm(n, device=self.device)
-            _eps_t = _eps_t[perm]
-        t = (t_max - t_min) * _eps_t + t_min
-        if accum_step is not None:
-            t = t.chunk(self.trainer.num_nodes)[self.trainer.node_rank]
-            t = t.chunk(self.trainer.num_devices)[self.trainer.local_rank]
-            t = t.chunk(self.trainer.accumulate_grad_batches)[accum_step]
-            t = t[:batch_dim]
-        return t
+        eps_t = self._sample_unit_interval(n, accum_step)
+        return (t_max - t_min) * eps_t + t_min
+
+    def _sample_t_interval(self, n, accum_step, t_min=None, t_max=None):
+        # Backward-compatible alias: FLM/FMLM sample in the reparameterized time.
+        return self._sample_tau_interval(
+            n, accum_step, t_min=t_min, t_max=t_max)
 
     def _tau_to_t(self, tau):
         """Convert t to reparameterized time tau."""
+        if self.time_reparam == 'none' or self.lut_a2g is None:
+            return tau
         return utils.alpha_to_gamma(tau, self.lut_a2g)
 
     def _t_to_tau(self, t):
         """Convert t to reparameterized time tau."""
+        if self.time_reparam == 'none' or self.lut_g2a is None:
+            return t
         return utils.gamma_to_alpha(t, self.lut_g2a)
 
+    def _dt_by_dtau(self, tau):
+        if self.time_reparam == 'none' or self.lut_a2g is None:
+            return torch.ones_like(tau)
+        return utils.d_alpha_to_gamma(tau, self.lut_a2g)
+
+    def _dtau_by_dt(self, t):
+        if self.time_reparam == 'none' or self.lut_g2a is None:
+            return torch.ones_like(t)
+        return utils.d_gamma_to_alpha(t, self.lut_g2a)
+
+    def _sample_vdm_physical_t(self, n, accum_step):
+        if self.vdm_schedule != 'linear_logsnr':
+            raise ValueError(
+                f'Unsupported vdm_schedule: {self.vdm_schedule}')
+        tau_min = self.t_min
+        tau_max = self.t_max
+        if self.time_reparam == 'none':
+            t_min = tau_min
+            t_max = tau_max
+        else:
+            t_min = float(self._tau_to_t(torch.tensor(
+                tau_min, device=self.device, dtype=torch.float32)).item())
+            t_max = float(self._tau_to_t(torch.tensor(
+                tau_max, device=self.device, dtype=torch.float32)).item())
+        eps_t = self._sample_unit_interval(n, accum_step)
+        if abs(t_max - t_min) < 1e-12:
+            return torch.full_like(eps_t, fill_value=t_min)
+
+        delta = self.vdm_logsnr_max - self.vdm_logsnr_min
+        snr_min = math.exp(self.vdm_logsnr_min + delta * t_min)
+        snr_max = math.exp(self.vdm_logsnr_min + delta * t_max)
+        snr_min = torch.tensor(
+            snr_min, device=self.device, dtype=eps_t.dtype)
+        snr_max = torch.tensor(
+            snr_max, device=self.device, dtype=eps_t.dtype)
+        sampled_snr = snr_min + eps_t * (snr_max - snr_min)
+        return (torch.log(sampled_snr) - self.vdm_logsnr_min) / delta
+
     def corrupt_continuous(self, x0, t):
-        """Corrupt data x0 at time t using linear interpolation with Gaussian noise."""
+        """Corrupt data x0 at time t using the configured continuous interpolant."""
         t = t.unsqueeze(-1).unsqueeze(-1)
         target_data = F.one_hot(x0, self.vocab_size).float()
         noise = torch.randn_like(target_data, dtype=torch.float32)
-        x_t = (1 - t) * noise + t * target_data
+        if self.interpolant_type == 'vdm_gaussian':
+            alpha_t = self._vdm_alpha(t.squeeze(-1).squeeze(-1)).view(
+                -1, 1, 1)
+            sigma_t = self._vdm_sigma(t.squeeze(-1).squeeze(-1)).view(
+                -1, 1, 1)
+            x_t = alpha_t * target_data + sigma_t * noise
+        else:
+            x_t = (1 - t) * noise + t * target_data
         return x_t, target_data
 
     def load_state_dict(self, state_dict, strict=True):
@@ -1032,13 +1170,116 @@ class FLMBase(trainer_base.TrainerBase):
 
 
 class FLM(FLMBase):
+    def __init__(self, config, tokenizer):
+        super().__init__(config, tokenizer)
+        self._validate_vdm_configuration()
+
+    def _validate_vdm_configuration(self):
+        if self.interpolant_type == 'vdm_gaussian':
+            if self.train_loss_name not in {'ce_upper_bound', 'l2_vdm'}:
+                raise ValueError(
+                    'VDM Gaussian FLM requires train_loss in '
+                    "{'ce_upper_bound', 'l2_vdm'}.")
+            if getattr(self.config.algo, 'learnable_loss_weighting', False):
+                raise ValueError(
+                    'learnable_loss_weighting is not supported for the '
+                    'VDM Gaussian FLM path.')
+            if self.time_sampling not in {'uniform', 'snr_reweighted'}:
+                raise ValueError(
+                    f'Unsupported time_sampling: {self.time_sampling}')
+            if self.time_reparam not in {'decoding_error_rate', 'none'}:
+                raise ValueError(
+                    f'Unsupported time_reparam: {self.time_reparam}')
+        else:
+            if self.train_loss_name != 'native':
+                raise ValueError(
+                    'Native FLM only supports train_loss=native.')
+            if self.time_sampling != 'uniform':
+                raise ValueError(
+                    'Native FLM only supports time_sampling=uniform.')
+
+    def _sample_vdm_times(
+            self,
+            n,
+            accum_step,
+            sample_mode=None):
+        if sample_mode is None:
+            sample_mode = self.time_sampling
+        if sample_mode == 'uniform':
+            tau_t = self._sample_tau_interval(
+                n, accum_step, t_min=self.t_min, t_max=self.t_max)
+            t = self._tau_to_t(tau_t)
+            return tau_t, t
+        if sample_mode == 'snr_reweighted':
+            t = self._sample_vdm_physical_t(n, accum_step)
+            tau_t = self._t_to_tau(t)
+            return tau_t, t
+        raise ValueError(f'Unsupported time_sampling: {sample_mode}')
+
+    def _compute_vdm_batch_terms(self, x0, tau_t, t=None):
+        if t is None:
+            t = self._tau_to_t(tau_t)
+        x_t, target_data = self.corrupt_continuous(x0, t)
+        logits = self.forward_no_softmax(x_t, tau_t)
+        log_probs = self._log_probs_from_logits(logits)
+        probs = log_probs.exp()
+        ce = -torch.gather(
+            log_probs, dim=-1, index=x0[:, :, None]).squeeze(-1)
+        p_true = torch.gather(
+            probs, dim=-1, index=x0[:, :, None]).squeeze(-1)
+        l2 = (target_data - probs).pow(2).sum(dim=-1)
+        eval_weight = self._vdm_snr_prime(t) * self._dt_by_dtau(tau_t)
+        weighted_ce = eval_weight[:, None] * ce
+        weighted_l2 = 0.5 * eval_weight[:, None] * l2
+        return {
+            'tau': tau_t,
+            't': t,
+            'ce': ce,
+            'l2': l2,
+            'p_true': p_true,
+            'weighted_ce': weighted_ce,
+            'weighted_l2': weighted_l2,
+        }
+
     def loss(self, x0, output_tokens,
              current_accumulation_step=None, train_mode=False,
              xT=None, given_t=None, not_sampling_t=False):
         del given_t, not_sampling_t, output_tokens
+        if self.interpolant_type == 'vdm_gaussian':
+            sampling_mode = self.time_sampling if train_mode else 'uniform'
+            tau_t, t = self._sample_vdm_times(
+                x0.shape[0],
+                current_accumulation_step,
+                sample_mode=sampling_mode)
+            batch_terms = self._compute_vdm_batch_terms(x0, tau_t, t=t)
+            ce_train = batch_terms['weighted_ce']
+            l2_train = batch_terms['weighted_l2']
+            if train_mode and sampling_mode == 'snr_reweighted':
+                ce_train = batch_terms['ce']
+                l2_train = 0.5 * batch_terms['l2']
+            if self.train_loss_name == 'ce_upper_bound':
+                loss = ce_train
+            elif self.train_loss_name == 'l2_vdm':
+                loss = l2_train
+            else:
+                raise ValueError(
+                    f'Unsupported train_loss: {self.train_loss_name}')
+            self.log('loss', loss.mean(), prog_bar=True, sync_dist=True)
+            return {
+                'loss': loss,
+                'extra_metrics': {
+                    'ce_upper_bound': batch_terms['weighted_ce'],
+                    'l2_bound': batch_terms['weighted_l2'],
+                    'slack': batch_terms['weighted_ce']
+                    - batch_terms['weighted_l2'],
+                    'p_true': batch_terms['p_true'],
+                },
+            }
+
         B = x0.shape[0]
-        tau_t = self._sample_t_interval(B, current_accumulation_step,
-                                    t_min=self.t_min, t_max=self.t_max)
+        tau_t = self._sample_tau_interval(
+            B, current_accumulation_step,
+            t_min=self.t_min, t_max=self.t_max)
         t = self._tau_to_t(tau_t)
         x_t, target_data = self.corrupt_continuous(x0, t)
         f = self.forward(x_t, tau_t) #condition on tau_t
@@ -1054,6 +1295,10 @@ class FLM(FLMBase):
     @torch.no_grad()
     def generate_samples(self, num_samples, num_steps=None, eps=1e-5):
         """Generate samples using Euler ODE solver."""
+        if self.interpolant_type == 'vdm_gaussian':
+            raise NotImplementedError(
+                'VDM Gaussian sample generation is out of scope for this '
+                'implementation. Set eval.generate_samples=False for VDM runs.')
         if num_steps is None:
             num_steps = self.config.sampling.steps
         B = num_samples

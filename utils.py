@@ -19,7 +19,7 @@ from scipy.integrate import quad
 from scipy.stats import norm
 from timm.scheduler import CosineLRScheduler
 from math import isfinite
-from typing import Union
+from typing import Callable, Union
 
 from numpy.polynomial.hermite import hermgauss
 from scipy.stats import norm
@@ -477,46 +477,52 @@ def compute_qs_fast(alpha: float, tau: float, b: float, K: int, M: int, *,
 # ----------------------------
 # Core Exact Computation (Gamma -> Alpha)
 # ----------------------------
-def compute_alpha_exact(gamma: np.ndarray, K: int, n_gh: int = 100, sigma_floor: float = 1e-12, is_diffusion=False) -> np.ndarray:
-    """
-    Computes q_c (Alpha) from Gamma using Gauss-Hermite integration.
-    This is the ground-truth function mapping Gamma -> Alpha.
-    """
-    gamma = np.asarray(gamma)
+def compute_standardized_q_correct_from_margin(
+        margin: np.ndarray,
+        K: int,
+        n_gh: int = 100) -> np.ndarray:
+    """Computes the Equation 25 reparameterized time from the decoding margin.
 
-    # 1. Standardized means (assuming tau=0, b=1.0 for this conversion)
-    sigma = 1.0 - gamma
-    if is_diffusion:
-        sigma = np.sqrt(sigma)
-    sigma = np.maximum(sigma, sigma_floor)
-    
-    m_c = gamma / sigma
-    
-    # 2. GH nodes/weights
+    For one-hot denoising with Gaussian noise, the decoding accuracy depends on
+    the standardized correct-vs-incorrect mean gap. This helper evaluates the
+    corresponding probability of correct decoding and standardizes it into the
+    [0, 1] time warp used by FLM.
+    """
+    margin = np.asarray(margin, dtype=np.float64)
+
     x, w = hermgauss(n_gh)
     w = w / np.sqrt(np.pi)
     z_nodes = np.sqrt(2.0) * x
 
-    # 3. Broadcasting
-    m_c_expanded = m_c[:, None]   # (B, 1)
-    z_expanded = z_nodes[None, :] # (1, n_gh)
-
-    # 4. Compute Log-CDFs
-    # L_cu = log(Phi(z + m_c))
-    L_cu = log_ndtr(z_expanded + m_c_expanded)
-
-    # 5. Weighted sum
-    # log_prod_c = (K - 1) * L_cu
-    log_prod_c = (K - 1) * L_cu
+    margin_expanded = np.atleast_1d(margin)[:, None]
+    z_expanded = z_nodes[None, :]
+    log_prod_c = (K - 1) * log_ndtr(z_expanded + margin_expanded)
     q_c = np.sum(w * np.exp(log_prod_c), axis=-1)
-    
-    # Debugged. should consider prob. from uniform noise.
-    alpha = K/(K-1.) * (q_c - 1./K)
 
-    alpha += (gamma-1) * 1e-10 # minor trick to ensure monotonicity
+    tau = (K / (K - 1.0)) * (q_c - (1.0 / K))
+    tau = np.clip(tau, 0.0, 1.0)
 
+    if np.ndim(margin) == 0:
+        return tau[0]
+    return tau
+
+
+def compute_alpha_exact(gamma: np.ndarray, K: int, n_gh: int = 100, sigma_floor: float = 1e-12, is_diffusion=False) -> np.ndarray:
+    """
+    Computes the Equation 25 time warp from the native FLM interpolant.
+    """
+    gamma = np.asarray(gamma)
+
+    sigma = 1.0 - gamma
+    if is_diffusion:
+        sigma = np.sqrt(sigma)
+    sigma = np.maximum(sigma, sigma_floor)
+
+    margin = gamma / sigma
+    alpha = compute_standardized_q_correct_from_margin(
+        margin, K=K, n_gh=n_gh)
+    alpha += (gamma - 1.0) * 1e-10  # preserve monotonicity at spline boundaries
     alpha = np.clip(alpha, 0.0, 1.0)
-
     return alpha
 
 def compute_alpha_exact_torch(gamma, K: int, x_np, w_np, sigma_floor: float = 1e-12, is_diffusion=False, device=None) -> torch.Tensor:
@@ -541,12 +547,11 @@ def compute_alpha_exact_torch(gamma, K: int, x_np, w_np, sigma_floor: float = 1e
     w = w / np.sqrt(np.pi)
     z_nodes = torch.sqrt(torch.tensor(2.0, dtype=dtype, device=device)) * x
 
-    m_c_expanded = m_c.unsqueeze(-1)
+    margin_expanded = m_c.unsqueeze(-1)
     z_expanded = z_nodes.unsqueeze(0)
 
-    L_cu = torch.special.log_ndtr(z_expanded + m_c_expanded)
-
-    log_prod_c = (K - 1) * L_cu
+    log_prod_c = (K - 1) * torch.special.log_ndtr(
+        z_expanded + margin_expanded)
     
     q_c = torch.sum(w.unsqueeze(0) * torch.exp(log_prod_c), dim=-1)
     
@@ -562,7 +567,11 @@ def compute_alpha_exact_torch(gamma, K: int, x_np, w_np, sigma_floor: float = 1e
 # LUT / Spline Implementation
 # ----------------------------
 
-def build_luts(K: int, n_points: int = 10000, is_diffusion=False) -> tuple[CubicSpline, CubicSpline]:
+def build_luts(
+        K: int,
+        n_points: int = 10000,
+        is_diffusion=False,
+        margin_fn: Callable[[np.ndarray], np.ndarray] | None = None) -> tuple[CubicSpline, CubicSpline]:
     """
     Builds two lookup tables (Splines):
     1. Alpha -> Gamma (Forward)
@@ -578,7 +587,15 @@ def build_luts(K: int, n_points: int = 10000, is_diffusion=False) -> tuple[Cubic
     gamma_vals = np.linspace(0.0, 1.0, n_points) # cont.
     
     # 2. Compute corresponding Gamma grid (Exact)
-    alpha_vals = compute_alpha_exact(gamma_vals, K=K, is_diffusion=is_diffusion) # disc.
+    if margin_fn is None:
+        alpha_vals = compute_alpha_exact(
+            gamma_vals, K=K, is_diffusion=is_diffusion)
+    else:
+        margin_vals = np.asarray(margin_fn(gamma_vals), dtype=np.float64)
+        alpha_vals = compute_standardized_q_correct_from_margin(
+            margin_vals, K=K)
+        alpha_vals += (gamma_vals - 1.0) * 1e-10
+        alpha_vals = np.clip(alpha_vals, 0.0, 1.0)
     
     # 3. Build Forward Spline (Alpha -> Gamma)
     # Alpha is strictly increasing. Safe.
@@ -608,16 +625,32 @@ def build_luts(K: int, n_points: int = 10000, is_diffusion=False) -> tuple[Cubic
 
 # LUT_A2G, LUT_G2A = build_luts(K=50000)
 
+def _evaluate_spline(
+        x: Union[np.ndarray, torch.Tensor],
+        lut: CubicSpline,
+        derivative_order: int = 0) -> Union[np.ndarray, torch.Tensor]:
+    x_min = lut.x[0]
+    x_max = lut.x[-1]
+
+    if isinstance(x, torch.Tensor):
+        dtype = x.dtype
+        x_np = x.detach().cpu().numpy()
+        x_np = np.clip(x_np, x_min, x_max)
+        y_np = np.asarray(lut(x_np, nu=derivative_order))
+        return torch.from_numpy(y_np).to(x.device, dtype=dtype)
+
+    x = np.asarray(x)
+    x = np.clip(x, x_min, x_max)
+    return np.asarray(lut(x, nu=derivative_order))
+
+
 def alpha_to_gamma(alpha: Union[np.ndarray, torch.tensor], lut: CubicSpline) -> Union[np.ndarray, torch.tensor]:
     """
     Maps Alpha -> Gamma using the LUT.
     """
     if isinstance(alpha, torch.Tensor):
-        dtype = alpha.dtype
-        gamma = np.clip(lut(alpha.cpu().numpy()), 0.0, 1.0)
-        return torch.from_numpy(gamma).to(alpha.device, dtype=dtype)
-    else:
-        return np.clip(lut(alpha), 0.0, 1.0)
+        return _evaluate_spline(alpha, lut).clamp(0.0, 1.0)
+    return np.clip(_evaluate_spline(alpha, lut), 0.0, 1.0)
 
 def gamma_to_alpha(gamma: Union[np.ndarray, torch.tensor], lut: CubicSpline) -> Union[np.ndarray, torch.tensor]:
     """
@@ -625,11 +658,25 @@ def gamma_to_alpha(gamma: Union[np.ndarray, torch.tensor], lut: CubicSpline) -> 
     """
     # Clip result to [0, 1] to avoid spline overshoot
     if isinstance(gamma, torch.Tensor):
-        dtype = gamma.dtype
-        alpha = np.clip(lut(gamma.cpu().numpy()), 0.0, 1.0)
-        return torch.from_numpy(alpha).to(gamma.device, dtype=dtype)
-    else:
-        return np.clip(lut(gamma), 0.0, 1.0)
-    
-    
-    
+        return _evaluate_spline(gamma, lut).clamp(0.0, 1.0)
+    return np.clip(_evaluate_spline(gamma, lut), 0.0, 1.0)
+
+
+def d_alpha_to_gamma(alpha: Union[np.ndarray, torch.Tensor], lut: CubicSpline) -> Union[np.ndarray, torch.Tensor]:
+    """Evaluates d gamma / d alpha for the inverse time-warp LUT."""
+    return _evaluate_spline(alpha, lut, derivative_order=1)
+
+
+def d_gamma_to_alpha(gamma: Union[np.ndarray, torch.Tensor], lut: CubicSpline) -> Union[np.ndarray, torch.Tensor]:
+    """Evaluates d alpha / d gamma for the forward time-warp LUT."""
+    return _evaluate_spline(gamma, lut, derivative_order=1)
+
+
+def d_alpha_by_d_gamma(gamma: Union[np.ndarray, torch.Tensor], lut: CubicSpline) -> Union[np.ndarray, torch.Tensor]:
+    """Backward-compatible alias for d alpha / d gamma."""
+    return d_gamma_to_alpha(gamma, lut)
+
+
+def d_gamma_by_d_alpha(alpha: Union[np.ndarray, torch.Tensor], lut: CubicSpline) -> Union[np.ndarray, torch.Tensor]:
+    """Backward-compatible alias for d gamma / d alpha."""
+    return d_alpha_to_gamma(alpha, lut)
