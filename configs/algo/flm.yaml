@@ -10,14 +10,12 @@ causal_attention: False
 ignore_bos: False
 interpolant_type: flm_linear
 train_loss: flm_original
-gamma_schedule: linear  # linear | flm_matched | old_checkpoint_compatible | old_checkpoint_flm_noise | flm_warp_snr_matched_nonvp
+gamma_schedule: linear  # linear | flm_weight_matched
 t_max: 1.0
 t_min: 0.0
 vdm_gamma_max: 10.0
 vdm_gamma_min: -10.0
-vdm_alpha_min: 0.05
-vdm_alpha_max: 0.95
-vdm_conditioning: gamma_normalized
+vdm_conditioning: tau  # tau | gamma_normalized
 time_sampling: uniform  # uniform | importance_snr_prime
 importance_sampling_power: 1.0
 importance_sampling_grid_size: 2048

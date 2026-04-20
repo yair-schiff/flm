@@ -142,8 +142,7 @@ class TrainerBase(L.LightningModule):
         return self
 
     def _uses_vdm_metrics(self):
-        return (getattr(self.config.algo, 'interpolant_type', 'flm_linear') == 'vdm_gaussian'
-                and getattr(self.config.algo, 'train_loss', 'flm_original') != 'flm_original')
+        return getattr(self.config.algo, 'train_loss', 'flm_original') != 'flm_original'
 
     def _get_train_metric_names(self):
         if not self._uses_vdm_metrics():

@@ -30,11 +30,12 @@ python -u -m main \
   model=small \
   model.length=128 \
   algo=flm \
-  algo.interpolant_type=vdm_gaussian \
+  algo.interpolant_type=vp_gaussian \
   algo.train_loss=ce_upper_bound \
   algo.t_min=0.01 \
   algo.t_max=0.99 \
-  algo.gamma_schedule=old_checkpoint_compatible \
+  algo.gamma_schedule=flm_weight_matched \
+  algo.vdm_conditioning=tau \
   checkpointing.monitor_metric=val/ce_upper_bound \
   eval.checkpoint_path=$checkpoint_path \
   sampling.num_sample_batches=0 \

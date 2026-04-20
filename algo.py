@@ -793,9 +793,7 @@ class FLMBase(trainer_base.TrainerBase):
         self.gamma_schedule = getattr(config.algo, 'gamma_schedule', 'linear')
         self.vdm_gamma_max = getattr(config.algo, 'vdm_gamma_max', 10.0)
         self.vdm_gamma_min = getattr(config.algo, 'vdm_gamma_min', -10.0)
-        self.vdm_alpha_min = getattr(config.algo, 'vdm_alpha_min', 0.05)
-        self.vdm_alpha_max = getattr(config.algo, 'vdm_alpha_max', 0.95)
-        self.vdm_conditioning = getattr(config.algo, 'vdm_conditioning', 'gamma_normalized')
+        self.vdm_conditioning = getattr(config.algo, 'vdm_conditioning', 'tau')
         self.time_sampling = getattr(config.algo, 'time_sampling', 'uniform')
         self.importance_sampling_power = getattr(
             config.algo, 'importance_sampling_power', 1.0)
@@ -902,99 +900,44 @@ class FLMBase(trainer_base.TrainerBase):
         weight = (x - x0) / (x1 - x0).clamp_min(1e-12)
         return y0 + weight * (y1 - y0)
 
-    def _use_vdm_gaussian(self):
-        return self.interpolant_type == 'vdm_gaussian'
+    def _uses_weighted_path(self):
+        return self.interpolant_type in {'flm_compatible_weighted', 'vp_gaussian'}
 
-    @staticmethod
-    def _alpha_to_snr_nonvp(alpha):
-        eps = 1e-8
-        alpha = alpha.clamp(eps, 1.0 - eps)
-        return (alpha / (1.0 - alpha)).square()
+    def _uses_vp_gaussian(self):
+        return self.interpolant_type == 'vp_gaussian'
 
-    def _snr_range_from_alpha_endpoints(self):
-        alpha_min = torch.as_tensor(
-            self.vdm_alpha_min, device=self.device, dtype=torch.float32)
-        alpha_max = torch.as_tensor(
-            self.vdm_alpha_max, device=self.device, dtype=torch.float32)
-        if not (0.0 < float(alpha_min) < float(alpha_max) < 1.0):
-            raise ValueError(
-                "Expected 0 < vdm_alpha_min < vdm_alpha_max < 1 for "
-                f"gamma_schedule={self.gamma_schedule!r}, got "
-                f"vdm_alpha_min={self.vdm_alpha_min}, "
-                f"vdm_alpha_max={self.vdm_alpha_max}")
-        snr_min = self._alpha_to_snr_nonvp(alpha_min)
-        snr_max = self._alpha_to_snr_nonvp(alpha_max)
-        return snr_min, snr_max
+    def _uses_flm_compatible_weighted(self):
+        return self.interpolant_type == 'flm_compatible_weighted'
 
     def _gamma_from_t(self, t):
         if self.gamma_schedule == 'linear':
             return self.vdm_gamma_max + t * (self.vdm_gamma_min - self.vdm_gamma_max)
-        if self.gamma_schedule == 'flm_matched':
+        if self.gamma_schedule == 'flm_weight_matched':
             tau = self._t_to_tau(t)
             return self.vdm_gamma_max + tau * (self.vdm_gamma_min - self.vdm_gamma_max)
-        if self.gamma_schedule == 'flm_warp_snr_matched_nonvp':
-            eps = 1e-8
-            tau = self._t_to_tau(t).clamp(eps, 1.0 - eps)
-            snr_min, snr_max = self._snr_range_from_alpha_endpoints()
-            snr = snr_min + (snr_max - snr_min) * tau
-            return -torch.log(snr.clamp_min(eps))
-        if self.gamma_schedule in (
-                'old_checkpoint_compatible',
-                'old_checkpoint_flm_noise'):
-            raise NotImplementedError(
-                "old_checkpoint_compatible defines gamma on FLM-sampled tau, "
-                "not directly on physical t")
         raise NotImplementedError(
             f"Unsupported gamma_schedule={self.gamma_schedule!r}. "
-            "Implemented schedules: linear, flm_matched, "
-            "flm_warp_snr_matched_nonvp, "
-            "old_checkpoint_compatible, old_checkpoint_flm_noise")
+            "Implemented schedules: linear, flm_weight_matched")
 
     def _alpha_sigma_snr_from_t(self, t):
-        eps = 1e-8
-        if self.gamma_schedule == 'flm_warp_snr_matched_nonvp':
-            tau = self._t_to_tau(t).clamp(eps, 1.0 - eps)
-            dt_dtau = self._d_t_by_d_tau(tau).clamp_min(eps)
-            snr_min, snr_max = self._snr_range_from_alpha_endpoints()
-            snr = snr_min + (snr_max - snr_min) * tau
-            sqrt_snr = torch.sqrt(snr.clamp_min(eps))
-            alpha = sqrt_snr / (1.0 + sqrt_snr)
-            sigma = 1.0 - alpha
-            snr_prime = (snr_max - snr_min) / dt_dtau
-            gamma = -torch.log(snr.clamp_min(eps))
-            return alpha, sigma, snr, snr_prime, gamma
-
         gamma = self._gamma_from_t(t)
         snr = torch.exp(-gamma)
         alpha = torch.sqrt(torch.sigmoid(-gamma))
         sigma = torch.sqrt(torch.sigmoid(gamma))
         if self.gamma_schedule == 'linear':
             gamma_prime = torch.full_like(t, self.vdm_gamma_min - self.vdm_gamma_max)
-        elif self.gamma_schedule == 'flm_matched':
+        elif self.gamma_schedule == 'flm_weight_matched':
             tau = self._t_to_tau(t)
             dt_dtau = self._d_t_by_d_tau(tau).clamp_min(1e-8)
             gamma_prime = (self.vdm_gamma_min - self.vdm_gamma_max) / dt_dtau
         else:
             raise NotImplementedError(
                 f"Unsupported gamma_schedule={self.gamma_schedule!r}. "
-                "Implemented schedules: linear, flm_matched, "
-                "flm_warp_snr_matched_nonvp")
+                "Implemented schedules: linear, flm_weight_matched")
         snr_prime = (-gamma_prime) * snr
         return alpha, sigma, snr, snr_prime, gamma
 
-    def _alpha_sigma_snr_from_tau_old_checkpoint_compatible(self, tau):
-        eps = 1e-8
-        tau = tau.clamp(eps, 1.0 - eps)
-        alpha = self._tau_to_t(tau).clamp(eps, 1.0 - eps)
-        sigma_sq = (1.0 - alpha.square()).clamp_min(eps)
-        sigma = torch.sqrt(sigma_sq)
-        snr = alpha.square() / sigma_sq
-        gamma = torch.log(sigma_sq / alpha.square())
-        alpha_prime = self._d_t_by_d_tau(tau).clamp_min(eps)
-        snr_prime = 2.0 * alpha * alpha_prime / sigma_sq.square()
-        return alpha, sigma, snr, snr_prime, gamma
-
-    def _alpha_sigma_snr_from_tau_old_checkpoint_flm_noise(self, tau):
+    def _alpha_sigma_snr_from_tau_flm_compatible_weighted(self, tau):
         eps = 1e-8
         tau = tau.clamp(eps, 1.0 - eps)
         alpha = self._tau_to_t(tau).clamp(eps, 1.0 - eps)
@@ -1011,7 +954,7 @@ class FLMBase(trainer_base.TrainerBase):
         tau_grid = torch.linspace(
             self.t_min, self.t_max, num_grid, device=self.device, dtype=torch.float32)
         _, _, _, snr_prime_grid, _ = (
-            self._alpha_sigma_snr_from_tau_old_checkpoint_flm_noise(tau_grid))
+            self._alpha_sigma_snr_from_tau_flm_compatible_weighted(tau_grid))
         proposal_weight_grid = snr_prime_grid.clamp_min(eps).pow(
             self.importance_sampling_power)
         delta = tau_grid[1:] - tau_grid[:-1]
@@ -1031,7 +974,7 @@ class FLMBase(trainer_base.TrainerBase):
         }
         return self._old_flm_noise_importance_cache
 
-    def _sample_tau_importance_old_checkpoint_flm_noise(self, n, accum_step):
+    def _sample_tau_importance_flm_compatible_weighted(self, n, accum_step):
         if self._old_flm_noise_importance_cache is None:
             self._build_old_flm_noise_importance_cache()
         cache = self._old_flm_noise_importance_cache
@@ -1070,10 +1013,10 @@ class FLMBase(trainer_base.TrainerBase):
         return tau, proposal_density
 
     def _sample_vdm_time_and_density(self, n, accum_step):
-        if (self.gamma_schedule == 'old_checkpoint_flm_noise'
+        if (self._uses_flm_compatible_weighted()
                 and self.time_sampling == 'importance_snr_prime'):
             tau, proposal_density = (
-                self._sample_tau_importance_old_checkpoint_flm_noise(
+                self._sample_tau_importance_flm_compatible_weighted(
                     n, accum_step))
             return tau, proposal_density
         sampled_t = self._sample_t_interval(n, accum_step,
@@ -1081,32 +1024,21 @@ class FLMBase(trainer_base.TrainerBase):
                                             t_max=self.t_max)
         return sampled_t, None
 
-    def _gamma_to_conditioning(self, gamma):
+    def _gamma_to_conditioning(self, gamma, t=None):
+        if self.vdm_conditioning == 'tau':
+            if t is None:
+                raise ValueError("vdm_conditioning='tau' requires physical time t")
+            return self._t_to_tau(t)
         if self.vdm_conditioning == 'gamma_normalized':
-            if self.gamma_schedule == 'flm_warp_snr_matched_nonvp':
-                snr_min, snr_max = self._snr_range_from_alpha_endpoints()
-                gamma_max = -torch.log(snr_min.clamp_min(1e-8))
-                gamma_min = -torch.log(snr_max.clamp_min(1e-8))
-            else:
-                gamma_max = torch.as_tensor(
-                    self.vdm_gamma_max, device=gamma.device, dtype=gamma.dtype)
-                gamma_min = torch.as_tensor(
-                    self.vdm_gamma_min, device=gamma.device, dtype=gamma.dtype)
+            gamma_max = torch.as_tensor(
+                self.vdm_gamma_max, device=gamma.device, dtype=gamma.dtype)
+            gamma_min = torch.as_tensor(
+                self.vdm_gamma_min, device=gamma.device, dtype=gamma.dtype)
             denom = gamma_min - gamma_max
             return (gamma - gamma_max) / denom
-        if self.vdm_conditioning == 'tau_from_t':
-            if self.gamma_schedule != 'flm_warp_snr_matched_nonvp':
-                raise NotImplementedError(
-                    "vdm_conditioning='tau_from_t' is currently only "
-                    "implemented for gamma_schedule='flm_warp_snr_matched_nonvp'")
-            snr_min, snr_max = self._snr_range_from_alpha_endpoints()
-            snr = torch.exp(-gamma)
-            denom = (snr_max - snr_min).clamp_min(1e-8)
-            return (snr - snr_min) / denom
-        if self.vdm_conditioning != 'gamma_normalized':
-            raise NotImplementedError(
-                f"Unsupported vdm_conditioning={self.vdm_conditioning!r}. "
-                "Implemented conditioning: gamma_normalized, tau_from_t")
+        raise NotImplementedError(
+            f"Unsupported vdm_conditioning={self.vdm_conditioning!r}. "
+            "Implemented conditioning: tau, gamma_normalized")
 
     def _tau_to_t(self, tau):
         """Convert t to reparameterized time tau."""
@@ -1140,19 +1072,10 @@ class FLMBase(trainer_base.TrainerBase):
         z_t = alpha * target_data + sigma * noise
         return z_t, target_data, gamma, snr_prime
 
-    def corrupt_continuous_vdm_old_checkpoint_compatible(self, x0, tau):
+    def corrupt_continuous_flm_compatible_weighted(self, x0, tau):
         target_data = F.one_hot(x0, self.vocab_size).float()
         noise = torch.randn_like(target_data, dtype=torch.float32)
-        alpha, sigma, _, snr_prime, gamma = self._alpha_sigma_snr_from_tau_old_checkpoint_compatible(tau)
-        alpha = alpha.unsqueeze(-1).unsqueeze(-1)
-        sigma = sigma.unsqueeze(-1).unsqueeze(-1)
-        z_t = alpha * target_data + sigma * noise
-        return z_t, target_data, gamma, snr_prime
-
-    def corrupt_continuous_vdm_old_checkpoint_flm_noise(self, x0, tau):
-        target_data = F.one_hot(x0, self.vocab_size).float()
-        noise = torch.randn_like(target_data, dtype=torch.float32)
-        alpha, sigma, _, snr_prime, gamma = self._alpha_sigma_snr_from_tau_old_checkpoint_flm_noise(tau)
+        alpha, sigma, _, snr_prime, gamma = self._alpha_sigma_snr_from_tau_flm_compatible_weighted(tau)
         alpha = alpha.unsqueeze(-1).unsqueeze(-1)
         sigma = sigma.unsqueeze(-1).unsqueeze(-1)
         z_t = alpha * target_data + sigma * noise
@@ -1348,6 +1271,44 @@ class FLMBase(trainer_base.TrainerBase):
 
 
 class FLM(FLMBase):
+    def __init__(self, config, tokenizer):
+        super().__init__(config, tokenizer)
+        self._validate_configuration()
+
+    def _validate_configuration(self):
+        if self.interpolant_type == 'flm_linear':
+            if self.train_loss_type != 'flm_original':
+                raise ValueError(
+                    "interpolant_type='flm_linear' requires "
+                    "train_loss='flm_original'")
+            return
+
+        if self.interpolant_type == 'flm_compatible_weighted':
+            if self.train_loss_type not in {'ce_upper_bound', 'l2_vdm'}:
+                raise ValueError(
+                    "interpolant_type='flm_compatible_weighted' requires "
+                    "train_loss in {'ce_upper_bound', 'l2_vdm'}")
+            return
+
+        if self.interpolant_type == 'vp_gaussian':
+            if self.train_loss_type not in {'ce_upper_bound', 'l2_vdm'}:
+                raise ValueError(
+                    "interpolant_type='vp_gaussian' requires "
+                    "train_loss in {'ce_upper_bound', 'l2_vdm'}")
+            if self.gamma_schedule not in {'linear', 'flm_weight_matched'}:
+                raise ValueError(
+                    "interpolant_type='vp_gaussian' requires "
+                    "gamma_schedule in {'linear', 'flm_weight_matched'}")
+            if self.time_sampling != 'uniform':
+                raise ValueError(
+                    "interpolant_type='vp_gaussian' currently requires "
+                    "time_sampling='uniform'")
+            return
+
+        raise ValueError(
+            "Unsupported interpolant_type. Expected one of: "
+            "'flm_linear', 'flm_compatible_weighted', 'vp_gaussian'")
+
     def _native_flm_loss(self, x0, tau_t):
         eps = 1e-5
         tau_t = tau_t.clamp(eps, 1.0 - eps)
@@ -1360,50 +1321,29 @@ class FLM(FLMBase):
 
     def _vdm_gaussian_loss(self, x0, t, proposal_density=None):
         eps = 1e-5
-        if self.gamma_schedule == 'old_checkpoint_compatible':
+        if self._uses_flm_compatible_weighted():
             tau = t.clamp(eps, 1.0 - eps)
-            z_t, target_data, _, snr_prime = self.corrupt_continuous_vdm_old_checkpoint_compatible(x0, tau)
-            cond_t = tau
-            tau_axis = tau
-        elif self.gamma_schedule == 'old_checkpoint_flm_noise':
-            tau = t.clamp(eps, 1.0 - eps)
-            z_t, target_data, _, snr_prime = self.corrupt_continuous_vdm_old_checkpoint_flm_noise(x0, tau)
+            z_t, target_data, _, snr_prime = self.corrupt_continuous_flm_compatible_weighted(x0, tau)
             cond_t = tau
             tau_axis = tau
         else:
             t = t.clamp(eps, 1.0 - eps)
             z_t, target_data, gamma, snr_prime = self.corrupt_continuous_vdm(x0, t)
-            cond_t = self._gamma_to_conditioning(gamma).clamp(0.0, 1.0)
+            cond_t = self._gamma_to_conditioning(gamma, t=t).clamp(0.0, 1.0)
             tau_axis = self._t_to_tau(t).clamp(0.0, 1.0)
-            if self.gamma_schedule == 'flm_warp_snr_matched_nonvp':
-                snr_min, snr_max = self._snr_range_from_alpha_endpoints()
-                stage = 'train' if self.training else 'val'
-                self.log(f'{stage}/configured_alpha_min',
-                         torch.as_tensor(self.vdm_alpha_min, device=self.device),
-                         on_step=False,
-                         on_epoch=True,
-                         sync_dist=True)
-                self.log(f'{stage}/configured_alpha_max',
-                         torch.as_tensor(self.vdm_alpha_max, device=self.device),
-                         on_step=False,
-                         on_epoch=True,
-                         sync_dist=True)
-                self.log(f'{stage}/implied_snr_min',
-                         snr_min,
-                         on_step=False,
-                         on_epoch=True,
-                         sync_dist=True)
-                self.log(f'{stage}/implied_snr_max',
-                         snr_max,
-                         on_step=False,
-                         on_epoch=True,
-                         sync_dist=True)
         f = self.forward(z_t, cond_t)
         ce = -(target_data * f).sum(dim=-1)
         ce_per_example = ce.mean(dim=-1)
+        probs = f.exp()
+        l2 = ((target_data - probs) ** 2).sum(dim=-1)
         stage = 'train' if self.training else 'val'
         self.log(f'{stage}/ce_unweighted',
                  ce.mean(),
+                 on_step=False,
+                 on_epoch=True,
+                 sync_dist=True)
+        self.log(f'{stage}/l2_unweighted',
+                 (0.5 * l2).mean(),
                  on_step=False,
                  on_epoch=True,
                  sync_dist=True)
@@ -1425,48 +1365,65 @@ class FLM(FLMBase):
                      on_epoch=True,
                      sync_dist=True)
 
+        if importance_correction is None:
+            ce_weighted = ce * snr_prime[:, None]
+            l2_weighted = 0.5 * l2 * snr_prime[:, None]
+        else:
+            ce_weighted = (
+                ce * snr_prime[:, None] * importance_correction[:, None])
+            l2_weighted = (
+                0.5 * l2 * snr_prime[:, None]
+                * importance_correction[:, None])
+
+        ce_weighted_per_example = ce_weighted.mean(dim=-1)
+        l2_weighted_per_example = l2_weighted.mean(dim=-1)
+
         if self.train_loss_type == 'ce_upper_bound':
-            if importance_correction is None:
-                weighted_loss = ce * snr_prime[:, None]
-            else:
-                weighted_loss = (
-                    ce * snr_prime[:, None] * importance_correction[:, None])
-            weighted_per_example = weighted_loss.mean(dim=-1)
             self.log(f'{stage}/ce_weighted',
-                     weighted_loss.mean(),
+                     ce_weighted.mean(),
                      on_step=False,
                      on_epoch=True,
                      sync_dist=True)
+            if not self.training:
+                self.log('val/l2_weighted',
+                         l2_weighted.mean(),
+                         on_step=False,
+                         on_epoch=True,
+                         sync_dist=True)
+                self.log('val/l2_bound',
+                         l2_weighted.mean(),
+                         on_step=False,
+                         on_epoch=True,
+                         sync_dist=True)
             self._log_vdm_bin_diagnostics(
                 tau_axis=tau_axis,
                 ce_per_example=ce_per_example,
                 snr_prime=snr_prime,
-                weighted_per_example=weighted_per_example)
+                weighted_per_example=ce_weighted_per_example)
+            weighted_loss = ce_weighted
         elif self.train_loss_type == 'l2_vdm':
-            probs = f.exp()
-            l2 = ((target_data - probs) ** 2).sum(dim=-1)
-            self.log(f'{stage}/l2_unweighted',
-                     (0.5 * l2).mean(),
-                     on_step=False,
-                     on_epoch=True,
-                     sync_dist=True)
-            if importance_correction is None:
-                weighted_loss = 0.5 * l2 * snr_prime[:, None]
-            else:
-                weighted_loss = (
-                    0.5 * l2 * snr_prime[:, None]
-                    * importance_correction[:, None])
-            weighted_per_example = weighted_loss.mean(dim=-1)
             self.log(f'{stage}/l2_weighted',
-                     weighted_loss.mean(),
+                     l2_weighted.mean(),
                      on_step=False,
                      on_epoch=True,
                      sync_dist=True)
+            if not self.training:
+                self.log('val/ce_weighted',
+                         ce_weighted.mean(),
+                         on_step=False,
+                         on_epoch=True,
+                         sync_dist=True)
+                self.log('val/ce_upper_bound',
+                         ce_weighted.mean(),
+                         on_step=False,
+                         on_epoch=True,
+                         sync_dist=True)
             self._log_vdm_bin_diagnostics(
                 tau_axis=tau_axis,
                 ce_per_example=ce_per_example,
                 snr_prime=snr_prime,
-                weighted_per_example=weighted_per_example)
+                weighted_per_example=l2_weighted_per_example)
+            weighted_loss = l2_weighted
         else:
             raise ValueError(
                 f"Unsupported VDM train_loss={self.train_loss_type!r}. "
@@ -1482,7 +1439,7 @@ class FLM(FLMBase):
         sampled_t, proposal_density = self._sample_vdm_time_and_density(
             B, current_accumulation_step)
 
-        if self._use_vdm_gaussian():
+        if self._uses_weighted_path():
             loss = self._vdm_gaussian_loss(
                 x0, sampled_t, proposal_density=proposal_density)
             self.log('loss', loss.mean(), prog_bar=True)

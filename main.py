@@ -395,6 +395,7 @@ def _train(diffusion_model, config, logger, tokenizer):
             config.training.finetune_path,
             tokenizer=tokenizer,
             config=config,
+            map_location='cpu',
             weights_only=False)
     else:
         model = diffusion_model(config, tokenizer=valid_ds.tokenizer)
