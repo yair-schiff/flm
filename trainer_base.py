@@ -104,7 +104,9 @@ class TrainerBase(L.LightningModule):
 
         self.metrics = metrics.Metrics(
             gen_ppl_eval_model_name_or_path=self.config.eval.gen_ppl_eval_model_name_or_path,
-            eval_ppl_batch_size=self.config.eval.perplexity_batch_size)
+            eval_ppl_batch_size=self.config.eval.perplexity_batch_size,
+            train_metric_names=self._get_train_metric_names(),
+            valid_metric_names=self._get_valid_metric_names())
 
         if self.config.training.ema > 0:
             self.ema = models.ema.ExponentialMovingAverage(
@@ -138,6 +140,22 @@ class TrainerBase(L.LightningModule):
         self = super().to(*args, **kwargs)
         self.metrics.to(*args, **kwargs)
         return self
+
+    def _uses_vdm_metrics(self):
+        return (getattr(self.config.algo, 'interpolant_type', 'flm_linear') == 'vdm_gaussian'
+                and getattr(self.config.algo, 'train_loss', 'flm_original') != 'flm_original')
+
+    def _get_train_metric_names(self):
+        if not self._uses_vdm_metrics():
+            return ('nll', 'bpd', 'ppl')
+        if self.config.algo.train_loss == 'ce_upper_bound':
+            return ('ce_upper_bound', 'nll_upper_ce', 'ppl_upper_ce')
+        if self.config.algo.train_loss == 'l2_vdm':
+            return ('l2_bound', 'nll_upper_l2', 'ppl_upper_l2')
+        return ('nll', 'bpd', 'ppl')
+
+    def _get_valid_metric_names(self):
+        return self._get_train_metric_names()
 
     def q_xt(self, x, alpha_t):
         raise NotImplementedError
@@ -322,8 +340,10 @@ class TrainerBase(L.LightningModule):
 
     def on_train_epoch_start(self):
         self.metrics.reset()
-        assert self.metrics.train_nlls.nll.mean_value == 0
-        assert self.metrics.train_nlls.nll.weight == 0
+        primary_metric = getattr(self.metrics.train_nlls,
+                                 self.metrics.train_primary_metric)
+        assert primary_metric.mean_value == 0
+        assert primary_metric.weight == 0
 
     def training_step(self, batch, batch_idx):
         current_accumulation_step = (
@@ -365,8 +385,10 @@ class TrainerBase(L.LightningModule):
     def on_validation_epoch_start(self):
         self.metrics.reset()
         self._eval_mode()
-        assert self.metrics.valid_nlls.nll.mean_value == 0
-        assert self.metrics.valid_nlls.nll.weight == 0
+        primary_metric = getattr(self.metrics.valid_nlls,
+                                 self.metrics.valid_primary_metric)
+        assert primary_metric.mean_value == 0
+        assert primary_metric.weight == 0
 
     def validation_step(self, batch, batch_idx):
         del batch_idx

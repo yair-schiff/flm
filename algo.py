@@ -788,7 +788,23 @@ class FLMBase(trainer_base.TrainerBase):
         super().__init__(config, tokenizer)
         self.t_min = config.algo.t_min
         self.t_max = config.algo.t_max
+        self.interpolant_type = getattr(config.algo, 'interpolant_type', 'flm_linear')
+        self.train_loss_type = getattr(config.algo, 'train_loss', 'flm_original')
+        self.gamma_schedule = getattr(config.algo, 'gamma_schedule', 'linear')
+        self.vdm_gamma_max = getattr(config.algo, 'vdm_gamma_max', 10.0)
+        self.vdm_gamma_min = getattr(config.algo, 'vdm_gamma_min', -10.0)
+        self.vdm_alpha_min = getattr(config.algo, 'vdm_alpha_min', 0.05)
+        self.vdm_alpha_max = getattr(config.algo, 'vdm_alpha_max', 0.95)
+        self.vdm_conditioning = getattr(config.algo, 'vdm_conditioning', 'gamma_normalized')
+        self.time_sampling = getattr(config.algo, 'time_sampling', 'uniform')
+        self.importance_sampling_power = getattr(
+            config.algo, 'importance_sampling_power', 1.0)
+        self.importance_sampling_grid_size = getattr(
+            config.algo, 'importance_sampling_grid_size', 2048)
+        self.vdm_debug_log_bins = getattr(config.algo, 'vdm_debug_log_bins', False)
+        self.vdm_debug_num_bins = getattr(config.algo, 'vdm_debug_num_bins', 8)
         self.lut_a2g, self.lut_g2a = utils.build_luts(K=self.vocab_size)
+        self._old_flm_noise_importance_cache = None
         self._is_resuming = (
             config.checkpointing.resume_from_ckpt
             and config.checkpointing.resume_ckpt_path is not None
@@ -876,6 +892,222 @@ class FLMBase(trainer_base.TrainerBase):
             t = t[:batch_dim]
         return t
 
+    def _interp_linear(self, x, xp, fp):
+        idx = torch.searchsorted(xp, x, right=True)
+        idx = idx.clamp(1, xp.numel() - 1)
+        x0 = xp[idx - 1]
+        x1 = xp[idx]
+        y0 = fp[idx - 1]
+        y1 = fp[idx]
+        weight = (x - x0) / (x1 - x0).clamp_min(1e-12)
+        return y0 + weight * (y1 - y0)
+
+    def _use_vdm_gaussian(self):
+        return self.interpolant_type == 'vdm_gaussian'
+
+    @staticmethod
+    def _alpha_to_snr_nonvp(alpha):
+        eps = 1e-8
+        alpha = alpha.clamp(eps, 1.0 - eps)
+        return (alpha / (1.0 - alpha)).square()
+
+    def _snr_range_from_alpha_endpoints(self):
+        alpha_min = torch.as_tensor(
+            self.vdm_alpha_min, device=self.device, dtype=torch.float32)
+        alpha_max = torch.as_tensor(
+            self.vdm_alpha_max, device=self.device, dtype=torch.float32)
+        if not (0.0 < float(alpha_min) < float(alpha_max) < 1.0):
+            raise ValueError(
+                "Expected 0 < vdm_alpha_min < vdm_alpha_max < 1 for "
+                f"gamma_schedule={self.gamma_schedule!r}, got "
+                f"vdm_alpha_min={self.vdm_alpha_min}, "
+                f"vdm_alpha_max={self.vdm_alpha_max}")
+        snr_min = self._alpha_to_snr_nonvp(alpha_min)
+        snr_max = self._alpha_to_snr_nonvp(alpha_max)
+        return snr_min, snr_max
+
+    def _gamma_from_t(self, t):
+        if self.gamma_schedule == 'linear':
+            return self.vdm_gamma_max + t * (self.vdm_gamma_min - self.vdm_gamma_max)
+        if self.gamma_schedule == 'flm_matched':
+            tau = self._t_to_tau(t)
+            return self.vdm_gamma_max + tau * (self.vdm_gamma_min - self.vdm_gamma_max)
+        if self.gamma_schedule == 'flm_warp_snr_matched_nonvp':
+            eps = 1e-8
+            tau = self._t_to_tau(t).clamp(eps, 1.0 - eps)
+            snr_min, snr_max = self._snr_range_from_alpha_endpoints()
+            snr = snr_min + (snr_max - snr_min) * tau
+            return -torch.log(snr.clamp_min(eps))
+        if self.gamma_schedule in (
+                'old_checkpoint_compatible',
+                'old_checkpoint_flm_noise'):
+            raise NotImplementedError(
+                "old_checkpoint_compatible defines gamma on FLM-sampled tau, "
+                "not directly on physical t")
+        raise NotImplementedError(
+            f"Unsupported gamma_schedule={self.gamma_schedule!r}. "
+            "Implemented schedules: linear, flm_matched, "
+            "flm_warp_snr_matched_nonvp, "
+            "old_checkpoint_compatible, old_checkpoint_flm_noise")
+
+    def _alpha_sigma_snr_from_t(self, t):
+        eps = 1e-8
+        if self.gamma_schedule == 'flm_warp_snr_matched_nonvp':
+            tau = self._t_to_tau(t).clamp(eps, 1.0 - eps)
+            dt_dtau = self._d_t_by_d_tau(tau).clamp_min(eps)
+            snr_min, snr_max = self._snr_range_from_alpha_endpoints()
+            snr = snr_min + (snr_max - snr_min) * tau
+            sqrt_snr = torch.sqrt(snr.clamp_min(eps))
+            alpha = sqrt_snr / (1.0 + sqrt_snr)
+            sigma = 1.0 - alpha
+            snr_prime = (snr_max - snr_min) / dt_dtau
+            gamma = -torch.log(snr.clamp_min(eps))
+            return alpha, sigma, snr, snr_prime, gamma
+
+        gamma = self._gamma_from_t(t)
+        snr = torch.exp(-gamma)
+        alpha = torch.sqrt(torch.sigmoid(-gamma))
+        sigma = torch.sqrt(torch.sigmoid(gamma))
+        if self.gamma_schedule == 'linear':
+            gamma_prime = torch.full_like(t, self.vdm_gamma_min - self.vdm_gamma_max)
+        elif self.gamma_schedule == 'flm_matched':
+            tau = self._t_to_tau(t)
+            dt_dtau = self._d_t_by_d_tau(tau).clamp_min(1e-8)
+            gamma_prime = (self.vdm_gamma_min - self.vdm_gamma_max) / dt_dtau
+        else:
+            raise NotImplementedError(
+                f"Unsupported gamma_schedule={self.gamma_schedule!r}. "
+                "Implemented schedules: linear, flm_matched, "
+                "flm_warp_snr_matched_nonvp")
+        snr_prime = (-gamma_prime) * snr
+        return alpha, sigma, snr, snr_prime, gamma
+
+    def _alpha_sigma_snr_from_tau_old_checkpoint_compatible(self, tau):
+        eps = 1e-8
+        tau = tau.clamp(eps, 1.0 - eps)
+        alpha = self._tau_to_t(tau).clamp(eps, 1.0 - eps)
+        sigma_sq = (1.0 - alpha.square()).clamp_min(eps)
+        sigma = torch.sqrt(sigma_sq)
+        snr = alpha.square() / sigma_sq
+        gamma = torch.log(sigma_sq / alpha.square())
+        alpha_prime = self._d_t_by_d_tau(tau).clamp_min(eps)
+        snr_prime = 2.0 * alpha * alpha_prime / sigma_sq.square()
+        return alpha, sigma, snr, snr_prime, gamma
+
+    def _alpha_sigma_snr_from_tau_old_checkpoint_flm_noise(self, tau):
+        eps = 1e-8
+        tau = tau.clamp(eps, 1.0 - eps)
+        alpha = self._tau_to_t(tau).clamp(eps, 1.0 - eps)
+        sigma = (1.0 - alpha).clamp_min(eps)
+        snr = alpha.square() / sigma.square()
+        gamma = torch.log(sigma.square() / alpha.square())
+        alpha_prime = self._d_t_by_d_tau(tau).clamp_min(eps)
+        snr_prime = 2.0 * alpha * alpha_prime / sigma.pow(3)
+        return alpha, sigma, snr, snr_prime, gamma
+
+    def _build_old_flm_noise_importance_cache(self):
+        eps = 1e-12
+        num_grid = max(int(self.importance_sampling_grid_size), 16)
+        tau_grid = torch.linspace(
+            self.t_min, self.t_max, num_grid, device=self.device, dtype=torch.float32)
+        _, _, _, snr_prime_grid, _ = (
+            self._alpha_sigma_snr_from_tau_old_checkpoint_flm_noise(tau_grid))
+        proposal_weight_grid = snr_prime_grid.clamp_min(eps).pow(
+            self.importance_sampling_power)
+        delta = tau_grid[1:] - tau_grid[:-1]
+        segment_mass = 0.5 * (
+            proposal_weight_grid[1:] + proposal_weight_grid[:-1]) * delta
+        cumulative_mass = torch.cat([
+            torch.zeros(1, device=self.device, dtype=torch.float32),
+            torch.cumsum(segment_mass, dim=0),
+        ])
+        total_mass = cumulative_mass[-1].clamp_min(eps)
+        cdf_grid = cumulative_mass / total_mass
+        self._old_flm_noise_importance_cache = {
+            'tau_grid': tau_grid,
+            'proposal_weight_grid': proposal_weight_grid,
+            'cdf_grid': cdf_grid,
+            'total_mass': total_mass,
+        }
+        return self._old_flm_noise_importance_cache
+
+    def _sample_tau_importance_old_checkpoint_flm_noise(self, n, accum_step):
+        if self._old_flm_noise_importance_cache is None:
+            self._build_old_flm_noise_importance_cache()
+        cache = self._old_flm_noise_importance_cache
+
+        if accum_step is not None:
+            batch_dim = n
+            n = self.config.loader.global_batch_size
+
+        eps_u = torch.rand(n, device=self.device)
+        if self.antithetic_sampling:
+            offset = torch.arange(n, device=self.device) / n
+            eps_u = (eps_u / n + offset) % 1
+            perm = torch.randperm(n, device=self.device)
+            eps_u = eps_u[perm]
+
+        tau = self._interp_linear(
+            eps_u, cache['cdf_grid'], cache['tau_grid'])
+        proposal_weight = self._interp_linear(
+            tau, cache['tau_grid'], cache['proposal_weight_grid']).clamp_min(1e-12)
+        proposal_density = proposal_weight / cache['total_mass']
+
+        if accum_step is not None:
+            tau = tau.chunk(self.trainer.num_nodes)[self.trainer.node_rank]
+            tau = tau.chunk(self.trainer.num_devices)[self.trainer.local_rank]
+            tau = tau.chunk(self.trainer.accumulate_grad_batches)[accum_step]
+            tau = tau[:batch_dim]
+
+            proposal_density = proposal_density.chunk(
+                self.trainer.num_nodes)[self.trainer.node_rank]
+            proposal_density = proposal_density.chunk(
+                self.trainer.num_devices)[self.trainer.local_rank]
+            proposal_density = proposal_density.chunk(
+                self.trainer.accumulate_grad_batches)[accum_step]
+            proposal_density = proposal_density[:batch_dim]
+
+        return tau, proposal_density
+
+    def _sample_vdm_time_and_density(self, n, accum_step):
+        if (self.gamma_schedule == 'old_checkpoint_flm_noise'
+                and self.time_sampling == 'importance_snr_prime'):
+            tau, proposal_density = (
+                self._sample_tau_importance_old_checkpoint_flm_noise(
+                    n, accum_step))
+            return tau, proposal_density
+        sampled_t = self._sample_t_interval(n, accum_step,
+                                            t_min=self.t_min,
+                                            t_max=self.t_max)
+        return sampled_t, None
+
+    def _gamma_to_conditioning(self, gamma):
+        if self.vdm_conditioning == 'gamma_normalized':
+            if self.gamma_schedule == 'flm_warp_snr_matched_nonvp':
+                snr_min, snr_max = self._snr_range_from_alpha_endpoints()
+                gamma_max = -torch.log(snr_min.clamp_min(1e-8))
+                gamma_min = -torch.log(snr_max.clamp_min(1e-8))
+            else:
+                gamma_max = torch.as_tensor(
+                    self.vdm_gamma_max, device=gamma.device, dtype=gamma.dtype)
+                gamma_min = torch.as_tensor(
+                    self.vdm_gamma_min, device=gamma.device, dtype=gamma.dtype)
+            denom = gamma_min - gamma_max
+            return (gamma - gamma_max) / denom
+        if self.vdm_conditioning == 'tau_from_t':
+            if self.gamma_schedule != 'flm_warp_snr_matched_nonvp':
+                raise NotImplementedError(
+                    "vdm_conditioning='tau_from_t' is currently only "
+                    "implemented for gamma_schedule='flm_warp_snr_matched_nonvp'")
+            snr_min, snr_max = self._snr_range_from_alpha_endpoints()
+            snr = torch.exp(-gamma)
+            denom = (snr_max - snr_min).clamp_min(1e-8)
+            return (snr - snr_min) / denom
+        if self.vdm_conditioning != 'gamma_normalized':
+            raise NotImplementedError(
+                f"Unsupported vdm_conditioning={self.vdm_conditioning!r}. "
+                "Implemented conditioning: gamma_normalized, tau_from_t")
+
     def _tau_to_t(self, tau):
         """Convert t to reparameterized time tau."""
         return utils.alpha_to_gamma(tau, self.lut_a2g)
@@ -898,6 +1130,83 @@ class FLMBase(trainer_base.TrainerBase):
         noise = torch.randn_like(target_data, dtype=torch.float32)
         x_t = (1 - t) * noise + t * target_data
         return x_t, target_data
+
+    def corrupt_continuous_vdm(self, x0, t):
+        target_data = F.one_hot(x0, self.vocab_size).float()
+        noise = torch.randn_like(target_data, dtype=torch.float32)
+        alpha, sigma, _, snr_prime, gamma = self._alpha_sigma_snr_from_t(t)
+        alpha = alpha.unsqueeze(-1).unsqueeze(-1)
+        sigma = sigma.unsqueeze(-1).unsqueeze(-1)
+        z_t = alpha * target_data + sigma * noise
+        return z_t, target_data, gamma, snr_prime
+
+    def corrupt_continuous_vdm_old_checkpoint_compatible(self, x0, tau):
+        target_data = F.one_hot(x0, self.vocab_size).float()
+        noise = torch.randn_like(target_data, dtype=torch.float32)
+        alpha, sigma, _, snr_prime, gamma = self._alpha_sigma_snr_from_tau_old_checkpoint_compatible(tau)
+        alpha = alpha.unsqueeze(-1).unsqueeze(-1)
+        sigma = sigma.unsqueeze(-1).unsqueeze(-1)
+        z_t = alpha * target_data + sigma * noise
+        return z_t, target_data, gamma, snr_prime
+
+    def corrupt_continuous_vdm_old_checkpoint_flm_noise(self, x0, tau):
+        target_data = F.one_hot(x0, self.vocab_size).float()
+        noise = torch.randn_like(target_data, dtype=torch.float32)
+        alpha, sigma, _, snr_prime, gamma = self._alpha_sigma_snr_from_tau_old_checkpoint_flm_noise(tau)
+        alpha = alpha.unsqueeze(-1).unsqueeze(-1)
+        sigma = sigma.unsqueeze(-1).unsqueeze(-1)
+        z_t = alpha * target_data + sigma * noise
+        return z_t, target_data, gamma, snr_prime
+
+    def _log_vdm_bin_diagnostics(self, tau_axis, ce_per_example, snr_prime, weighted_per_example):
+        if (not self.vdm_debug_log_bins) or self.vdm_debug_num_bins <= 0:
+            return
+
+        stage = 'train' if self.training else 'val'
+        tau_axis = tau_axis.detach().clamp(0.0, 1.0)
+        ce_per_example = ce_per_example.detach()
+        snr_prime = snr_prime.detach()
+        weighted_per_example = weighted_per_example.detach()
+
+        bin_edges = torch.linspace(
+            0.0, 1.0, self.vdm_debug_num_bins + 1, device=tau_axis.device)
+        for bin_idx in range(self.vdm_debug_num_bins):
+            left = bin_edges[bin_idx]
+            right = bin_edges[bin_idx + 1]
+            if bin_idx == self.vdm_debug_num_bins - 1:
+                mask = (tau_axis >= left) & (tau_axis <= right)
+            else:
+                mask = (tau_axis >= left) & (tau_axis < right)
+
+            if not mask.any():
+                continue
+
+            suffix = f'bin_{bin_idx:02d}'
+            self.log(f'{stage}/diag_tau_{suffix}_frac',
+                     mask.float().mean(),
+                     on_step=False,
+                     on_epoch=True,
+                     sync_dist=True)
+            self.log(f'{stage}/diag_tau_{suffix}_mean',
+                     tau_axis[mask].mean(),
+                     on_step=False,
+                     on_epoch=True,
+                     sync_dist=True)
+            self.log(f'{stage}/diag_tau_{suffix}_ce',
+                     ce_per_example[mask].mean(),
+                     on_step=False,
+                     on_epoch=True,
+                     sync_dist=True)
+            self.log(f'{stage}/diag_tau_{suffix}_snr_prime',
+                     snr_prime[mask].mean(),
+                     on_step=False,
+                     on_epoch=True,
+                     sync_dist=True)
+            self.log(f'{stage}/diag_tau_{suffix}_ce_weighted',
+                     weighted_per_example[mask].mean(),
+                     on_step=False,
+                     on_epoch=True,
+                     sync_dist=True)
 
     def load_state_dict(self, state_dict, strict=True):
         return super().load_state_dict(state_dict, strict=False)
@@ -1039,32 +1348,155 @@ class FLMBase(trainer_base.TrainerBase):
 
 
 class FLM(FLMBase):
+    def _native_flm_loss(self, x0, tau_t):
+        eps = 1e-5
+        tau_t = tau_t.clamp(eps, 1.0 - eps)
+        t = self._tau_to_t(tau_t).clamp(eps, 1.0 - eps)
+
+        x_t, target_data = self.corrupt_continuous(x0, t)
+        f = self.forward(x_t, tau_t)
+        ce = -(target_data * f).sum(dim=-1)
+        return ce
+
+    def _vdm_gaussian_loss(self, x0, t, proposal_density=None):
+        eps = 1e-5
+        if self.gamma_schedule == 'old_checkpoint_compatible':
+            tau = t.clamp(eps, 1.0 - eps)
+            z_t, target_data, _, snr_prime = self.corrupt_continuous_vdm_old_checkpoint_compatible(x0, tau)
+            cond_t = tau
+            tau_axis = tau
+        elif self.gamma_schedule == 'old_checkpoint_flm_noise':
+            tau = t.clamp(eps, 1.0 - eps)
+            z_t, target_data, _, snr_prime = self.corrupt_continuous_vdm_old_checkpoint_flm_noise(x0, tau)
+            cond_t = tau
+            tau_axis = tau
+        else:
+            t = t.clamp(eps, 1.0 - eps)
+            z_t, target_data, gamma, snr_prime = self.corrupt_continuous_vdm(x0, t)
+            cond_t = self._gamma_to_conditioning(gamma).clamp(0.0, 1.0)
+            tau_axis = self._t_to_tau(t).clamp(0.0, 1.0)
+            if self.gamma_schedule == 'flm_warp_snr_matched_nonvp':
+                snr_min, snr_max = self._snr_range_from_alpha_endpoints()
+                stage = 'train' if self.training else 'val'
+                self.log(f'{stage}/configured_alpha_min',
+                         torch.as_tensor(self.vdm_alpha_min, device=self.device),
+                         on_step=False,
+                         on_epoch=True,
+                         sync_dist=True)
+                self.log(f'{stage}/configured_alpha_max',
+                         torch.as_tensor(self.vdm_alpha_max, device=self.device),
+                         on_step=False,
+                         on_epoch=True,
+                         sync_dist=True)
+                self.log(f'{stage}/implied_snr_min',
+                         snr_min,
+                         on_step=False,
+                         on_epoch=True,
+                         sync_dist=True)
+                self.log(f'{stage}/implied_snr_max',
+                         snr_max,
+                         on_step=False,
+                         on_epoch=True,
+                         sync_dist=True)
+        f = self.forward(z_t, cond_t)
+        ce = -(target_data * f).sum(dim=-1)
+        ce_per_example = ce.mean(dim=-1)
+        stage = 'train' if self.training else 'val'
+        self.log(f'{stage}/ce_unweighted',
+                 ce.mean(),
+                 on_step=False,
+                 on_epoch=True,
+                 sync_dist=True)
+
+        if proposal_density is None:
+            importance_correction = None
+        else:
+            tau_width = max(float(self.t_max - self.t_min), eps)
+            importance_correction = (
+                1.0 / (tau_width * proposal_density.clamp_min(eps)))
+            self.log(f'{stage}/proposal_density_mean',
+                     proposal_density.mean(),
+                     on_step=False,
+                     on_epoch=True,
+                     sync_dist=True)
+            self.log(f'{stage}/importance_correction_mean',
+                     importance_correction.mean(),
+                     on_step=False,
+                     on_epoch=True,
+                     sync_dist=True)
+
+        if self.train_loss_type == 'ce_upper_bound':
+            if importance_correction is None:
+                weighted_loss = ce * snr_prime[:, None]
+            else:
+                weighted_loss = (
+                    ce * snr_prime[:, None] * importance_correction[:, None])
+            weighted_per_example = weighted_loss.mean(dim=-1)
+            self.log(f'{stage}/ce_weighted',
+                     weighted_loss.mean(),
+                     on_step=False,
+                     on_epoch=True,
+                     sync_dist=True)
+            self._log_vdm_bin_diagnostics(
+                tau_axis=tau_axis,
+                ce_per_example=ce_per_example,
+                snr_prime=snr_prime,
+                weighted_per_example=weighted_per_example)
+        elif self.train_loss_type == 'l2_vdm':
+            probs = f.exp()
+            l2 = ((target_data - probs) ** 2).sum(dim=-1)
+            self.log(f'{stage}/l2_unweighted',
+                     (0.5 * l2).mean(),
+                     on_step=False,
+                     on_epoch=True,
+                     sync_dist=True)
+            if importance_correction is None:
+                weighted_loss = 0.5 * l2 * snr_prime[:, None]
+            else:
+                weighted_loss = (
+                    0.5 * l2 * snr_prime[:, None]
+                    * importance_correction[:, None])
+            weighted_per_example = weighted_loss.mean(dim=-1)
+            self.log(f'{stage}/l2_weighted',
+                     weighted_loss.mean(),
+                     on_step=False,
+                     on_epoch=True,
+                     sync_dist=True)
+            self._log_vdm_bin_diagnostics(
+                tau_axis=tau_axis,
+                ce_per_example=ce_per_example,
+                snr_prime=snr_prime,
+                weighted_per_example=weighted_per_example)
+        else:
+            raise ValueError(
+                f"Unsupported VDM train_loss={self.train_loss_type!r}. "
+                "Expected one of: ce_upper_bound, l2_vdm")
+        return weighted_loss
+
     def loss(self, x0, output_tokens,
              current_accumulation_step=None, train_mode=False,
              xT=None, given_t=None, not_sampling_t=False):
         del given_t, not_sampling_t, output_tokens
         B = x0.shape[0]
         eps = 1e-5
-        tau_t = self._sample_t_interval(B, current_accumulation_step,
-                                        t_min=self.t_min, t_max=self.t_max)
-        tau_t = tau_t.clamp(eps, 1.0 - eps)
-        t = self._tau_to_t(tau_t).clamp(eps, 1.0 - eps)        
+        sampled_t, proposal_density = self._sample_vdm_time_and_density(
+            B, current_accumulation_step)
 
-        x_t, target_data = self.corrupt_continuous(x0, t)
-        f = self.forward(x_t, tau_t) #condition on tau_t
-        loss = -(target_data * f).sum(dim=-1)
-        # TODO: Test L2 loss as well 
-        # loss = ((target_data - torch.exp(f))**2).sum(dim=-1)
+        if self._use_vdm_gaussian():
+            loss = self._vdm_gaussian_loss(
+                x0, sampled_t, proposal_density=proposal_density)
+            self.log('loss', loss.mean(), prog_bar=True)
+            return loss
+
+        tau_t = sampled_t.clamp(eps, 1.0 - eps)
+        loss = self._native_flm_loss(x0, tau_t)
         self.log('loss', loss.mean(), prog_bar=True)
         if self.config.algo.learnable_loss_weighting is True:
             loss_weight = self.backbone.learnable_loss_weighting(tau_t)
             loss_weight = loss_weight.unsqueeze(-1)
             loss = torch.exp(-loss_weight) * loss + loss_weight
             self.log('loss_weighted', loss.mean(), prog_bar=True)
-        dt_dtau = self._d_t_by_d_tau(tau_t).clamp_min(eps)
-        snr_weight = 2*t*dt_dtau / (1 - t)**3  # -SNR'(t_d) = -SNR'(t_d(t_fm)) dt_d/dt_fm = SNR'(t_fm)
-        return loss * snr_weight[:, None]
-        # return loss
+        return loss
 
     @torch.no_grad()
     def generate_samples(self, num_samples, num_steps=None, eps=1e-5):

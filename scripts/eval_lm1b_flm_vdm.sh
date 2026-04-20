@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH -J eval_flm                   # Job name
+#SBATCH -J eval_flm_vdm               # Job name
 #SBATCH -o watch_folder/%x_%j.out     # log file (out & err)
 #SBATCH -N 1                          # Total number of nodes requested
 #SBATCH --get-user-env                # retrieve the users login environment
@@ -20,7 +20,6 @@ cd ../ || exit  # Go to the root directory of the repo
 source setup_env.sh || exit
 export HYDRA_FULL_ERROR=1
 
-#srun python -u -m main \
 python -u -m main \
   mode=ppl_eval \
   loader.batch_size=8 \
@@ -31,8 +30,15 @@ python -u -m main \
   model=small \
   model.length=128 \
   algo=flm \
+  algo.interpolant_type=vdm_gaussian \
+  algo.train_loss=ce_upper_bound \
+  algo.t_min=0.01 \
+  algo.t_max=0.99 \
+  algo.gamma_schedule=old_checkpoint_compatible \
+  checkpointing.monitor_metric=val/ce_upper_bound \
   eval.checkpoint_path=$checkpoint_path \
   sampling.num_sample_batches=0 \
   eval.generate_samples=false \
   eval.compute_generative_perplexity=false \
-  +wandb.offline=true
+  +wandb.offline=true \
+  "$@"
