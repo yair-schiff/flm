@@ -1,4 +1,10 @@
-CKPT_PATH="YOUR_CHECKPOINT_PATH"
+#!/bin/bash
+CKPT_PATH="/share/kuleshov/yzs2/flm-og/outputs/lm1b/lm1b_flm.ckpt"
+
+# Setup environment
+cd ../ || exit  # Go to the root directory of the repo
+source setup_env.sh || exit
+export HYDRA_FULL_ERROR=1
 STEPS=1024
 
 python -u -m main \
@@ -15,4 +21,4 @@ python -u -m main \
       sampling.steps=$STEPS \
       algo.double_temb=False \
       eval.disable_ema=False \
-      +wandb.offline=true \
+      +wandb.offline=true

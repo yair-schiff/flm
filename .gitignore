@@ -46,3 +46,7 @@ hf_upload/
 # OS
 .DS_Store
 Thumbs.db
+
+# HF
+.hf_cache
+

@@ -1,4 +1,11 @@
-CKPT_PATH="YOUR_CHECKPOINT_PATH"
+#!/bin/bash
+CKPT_PATH="/share/kuleshov/yzs2/flm-og/outputs/owt/owt_flm.ckpt"
+
+# Setup environment
+cd ../ || exit  # Go to the root directory of the repo
+source setup_env.sh || exit
+export HYDRA_FULL_ERROR=1
+
 STEPS=1024
 
 python -u -m main \

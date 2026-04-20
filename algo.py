@@ -429,7 +429,7 @@ class DUO_BASE(trainer_base.UniformState):
 
 class Integral(torch.autograd.Function):
     """
-    torch module calculating UDLM's p_t 
+    torch module calculating UDLM's p_t
     """
 
     @staticmethod
@@ -539,7 +539,7 @@ class DUO(DUO_BASE):
                                                  current_accumulation_step)
         del output_tokens
         t = self._sample_t(x0.shape[0], current_accumulation_step)
-        gamma_t = self.gamma_min + t * (self.gamma_max - self.gamma_min)    
+        gamma_t = self.gamma_min + t * (self.gamma_max - self.gamma_min)
         gamma_t_prime = self.gamma_max - self.gamma_min
         alpha_t = self._gamma_to_alphat(gamma_t)
         T = 1000
@@ -884,6 +884,13 @@ class FLMBase(trainer_base.TrainerBase):
         """Convert t to reparameterized time tau."""
         return utils.gamma_to_alpha(t, self.lut_g2a)
 
+    def _d_t_by_d_tau(self, tau):
+        """
+        Since _tau_to_t(tau) = alpha_to_gamma(tau, self.lut_a2g),
+        this returns dt/dtau from the same spline.
+        """
+        return utils.d_alpha_to_gamma(tau, self.lut_a2g)
+
     def corrupt_continuous(self, x0, t):
         """Corrupt data x0 at time t using linear interpolation with Gaussian noise."""
         t = t.unsqueeze(-1).unsqueeze(-1)
@@ -1037,19 +1044,27 @@ class FLM(FLMBase):
              xT=None, given_t=None, not_sampling_t=False):
         del given_t, not_sampling_t, output_tokens
         B = x0.shape[0]
+        eps = 1e-5
         tau_t = self._sample_t_interval(B, current_accumulation_step,
-                                    t_min=self.t_min, t_max=self.t_max)
-        t = self._tau_to_t(tau_t)
+                                        t_min=self.t_min, t_max=self.t_max)
+        tau_t = tau_t.clamp(eps, 1.0 - eps)
+        t = self._tau_to_t(tau_t).clamp(eps, 1.0 - eps)        
+
         x_t, target_data = self.corrupt_continuous(x0, t)
         f = self.forward(x_t, tau_t) #condition on tau_t
         loss = -(target_data * f).sum(dim=-1)
+        # TODO: Test L2 loss as well 
+        # loss = ((target_data - torch.exp(f))**2).sum(dim=-1)
         self.log('loss', loss.mean(), prog_bar=True)
         if self.config.algo.learnable_loss_weighting is True:
             loss_weight = self.backbone.learnable_loss_weighting(tau_t)
             loss_weight = loss_weight.unsqueeze(-1)
             loss = torch.exp(-loss_weight) * loss + loss_weight
             self.log('loss_weighted', loss.mean(), prog_bar=True)
-        return loss
+        dt_dtau = self._d_t_by_d_tau(tau_t).clamp_min(eps)
+        snr_weight = 2*t*dt_dtau / (1 - t)**3  # -SNR'(t_d) = -SNR'(t_d(t_fm)) dt_d/dt_fm = SNR'(t_fm)
+        return loss * snr_weight[:, None]
+        # return loss
 
     @torch.no_grad()
     def generate_samples(self, num_samples, num_steps=None, eps=1e-5):
@@ -1081,7 +1096,7 @@ class FLM(FLMBase):
             z = z + dt.view(-1, 1, 1) * v
 
         return z.argmax(dim=-1)
-    
+
 class FMLM(FLMBase):
     def __init__(self, config, tokenizer):
         super().__init__(config, tokenizer)
@@ -1350,7 +1365,7 @@ class FMLM(FLMBase):
 
         elif self.config.algo.distillation_method == "ESD": # Eulerian Distillation
             use_jvp_attn = True
-            
+
             if has_diag:
                 log_D_st_diag = self.forward(
                     x_s[idx_diag], s[idx_diag], t[idx_diag], use_jvp_attn=False
@@ -1359,14 +1374,14 @@ class FMLM(FLMBase):
             else:
                 log_D_st_diag = x_s.new_empty((0, L, self.vocab_size))
                 diag_loss = x_s.new_empty((0, L))
-            
+
             if has_offdiag:
                 x_s_od = x_s[idx_offdiag]
                 s_od = s[idx_offdiag]
                 t_od = t[idx_offdiag]
                 tau_s_od = tau_s[idx_offdiag]
                 tau_t_od = tau_t[idx_offdiag]
-                
+
                 with torch.no_grad():
                     use_teacher = (
                         self.teacher_model is not None
@@ -1378,47 +1393,47 @@ class FMLM(FLMBase):
                         D_s = self.forward(
                             x_s_od, tau_s_od, tau_t_od, use_jvp_attn=False
                         ).exp()
-                
+
                 d_tau_s_by_d_s = self._d_tau_by_d_t(
                     s_od.view(-1, 1, 1)
                 ).squeeze()
-                
+
                 with torch.enable_grad():
                     def forward_s_x(tau_s_val, x_s_val):
                         return self.forward(
                             x_s_val, tau_s_val, tau_t_od,
                             use_jvp_attn=use_jvp_attn
                         )
-                    
+
                     tangent_tau_s = d_tau_s_by_d_s * torch.ones_like(tau_s_od)
                     tangent_x_s = (D_s - x_s_od) / (1 - s_od.view(-1, 1, 1) + 1e-8)
-                    
+
                     log_D_st_offdiag, d_ds_log_D_st = torch.func.jvp(
                         forward_s_x,
                         (tau_s_od, x_s_od),
                         (tangent_tau_s, tangent_x_s),
                     )
                     d_ds_log_D_st = stopgrad(d_ds_log_D_st)
-                
+
                 with torch.no_grad():
                     s_g = s_od.view(-1, 1, 1)
                     t_g = t_od.view(-1, 1, 1)
-                    
+
                     D_st = log_D_st_offdiag.exp()
                     d_ds_D_st = D_st * d_ds_log_D_st
-                    
+
                     coeff = (1 - s_g) * (t_g - s_g) / (1 - t_g + 1e-8)
                     offdiag_target = stopgrad(D_s + coeff * d_ds_D_st)
-                
+
                 offdiag_loss = F.mse_loss(log_D_st_offdiag.exp(), offdiag_target, reduction='none').sum(dim=-1)
             else:
                 log_D_st_offdiag = x_s.new_empty((0, L, self.vocab_size))
                 offdiag_loss = x_s.new_empty((0, L))
-            
+
             log_D_st = torch.zeros(B, L, self.vocab_size, device=self.device)
             log_D_st[idx_offdiag] = log_D_st_offdiag
             log_D_st[idx_diag] = log_D_st_diag
-            
+
         else: # Langrangian distillation
             use_jvp_attn = True
 
@@ -1489,14 +1504,14 @@ class FMLM(FLMBase):
             log_D_st[idx_diag] = log_D_st_diag
 
         loss = torch.zeros(B, L, device=self.device)
-        
+
         if has_diag:
             loss[idx_diag] = diag_loss
             diag_loss_to_log = diag_loss.mean()
         else:
             diag_loss_to_log = loss.new_tensor(0.0)
         self.log('diag_loss', diag_loss_to_log, prog_bar=True, sync_dist=True)
-        
+
         if has_offdiag:
             loss[idx_offdiag] = offdiag_loss
             offdiag_loss_to_log = offdiag_loss.mean()
@@ -1520,7 +1535,7 @@ class FMLM(FLMBase):
             num_steps = self.config.sampling.steps
         gamma = getattr(self.config.sampling, 'gamma', 0.0)
         print(f"Sampling with {num_steps} steps")
-        
+
         B = num_samples
         V = self.vocab_size
         L = self.num_tokens
@@ -1562,7 +1577,7 @@ class FMLM(FLMBase):
                 z = z_tilde + mean_adjustment * D_st_pred + noise_std * torch.randn_like(z)
             else:
                 z = z_tilde
-                
+
         return z.argmax(dim=-1)
 
 
@@ -1827,9 +1842,9 @@ class FMLM_TwoStage(FLMBase):
         L = self.num_tokens
         device = self.device
 
-        tau_vals = torch.linspace(0.0, 1.0, num_steps + 1, device=device)  
+        tau_vals = torch.linspace(0.0, 1.0, num_steps + 1, device=device)
         z = torch.randn((num_samples, L, V), device=device, dtype=self.dtype)
-        
+
         for i in range(num_steps):
             tau_curr = tau_vals[i]
             tau_next = tau_vals[i + 1]
@@ -1861,5 +1876,5 @@ class FMLM_TwoStage(FLMBase):
                 z = z_tilde + mean_adjustment * D_st_pred + noise_std * torch.randn_like(z)
             else:
                 z = z_tilde
-                
+
         return z.argmax(dim=-1)

@@ -137,7 +137,8 @@ def _generate_samples(diffusion_model, config, logger,
             all_samples.extend(list(text_samples))
 
     print("generation end: " + datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-
+    import ipdb
+    ipdb.set_trace()
     generative_ppl = 0.
     entropy = 0.
     if not config.sampling.semi_ar:

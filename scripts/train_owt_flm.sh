@@ -1,6 +1,11 @@
 #!/bin/bash
 
-DATA_DIR="YOUR_DATA_DIR"
+DATA_DIR="/share/kuleshov/yzs2/data"
+# Setup environment
+cd ../ || exit  # Go to the root directory of the repo
+source setup_env.sh || exit
+export HYDRA_FULL_ERROR=1
+
 
 python -u -m main \
   loader.global_batch_size=512 \
