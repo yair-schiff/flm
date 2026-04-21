@@ -1,7 +1,25 @@
 #!/bin/bash
+#SBATCH -J train_flm_vdm                  # Job name
+#SBATCH -o ../watch_folder/%x_%j.out     # log file (out & err)
+#SBATCH -N 1                          # Total number of nodes requested
+#SBATCH --get-user-env                # retrieve the users login environment
+#SBATCH --mem=100000                  # server memory requested (per node)
+#SBATCH -t 960:00:00                  # Time limit (hh:mm:ss)
+#SBATCH --partition=kuleshov,gpu               # Request partition
+#SBATCH --constraint="[h200|h100|a100|a6000|a5000]"
+#SBATCH --ntasks-per-node=8
+#SBATCH --gres=gpu:8                  # Type/number of GPUs needed
+#SBATCH --open-mode=append            # Do not overwrite logs
+#SBATCH --requeue                     # Requeue upon preemption
+
+export DIT_USE_COMPILE=TRUE
+TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-/share/kuleshov/yzs2/torchinductor-cache}"
+export TORCHINDUCTOR_CACHE_DIR="$TORCHINDUCTOR_CACHE_DIR"
+
 DATA_DIR="${DATA_DIR:-/share/kuleshov/yzs2/data}"
 
 REPO_ROOT="${FLM_REPO_ROOT:-/share/kuleshov/yzs2/flm-og}"
+RUN_NAME="${RUN_NAME:-lm1b_full_flm_vdm}"
 
 cd "${REPO_ROOT}" || exit
 source "${REPO_ROOT}/setup_env.sh" || exit
@@ -30,7 +48,7 @@ torchrun --nnodes=$NUM_NODES --nproc_per_node=$NPROC --master_port=$MASTER_PORT 
   data=lm1b-wrap \
   data.cache_dir=$DATA_DIR \
   wandb.project=lm1b_full \
-  wandb.name=lm1b_full_flm_vdm \
+  wandb.name=${RUN_NAME} \
   model=small \
   algo=flm_vdm \
   model.length=128 \
@@ -42,7 +60,10 @@ torchrun --nnodes=$NUM_NODES --nproc_per_node=$NPROC --master_port=$MASTER_PORT 
   trainer.val_check_interval=5000 \
   algo.double_temb=False \
   callbacks.checkpoint_every_n_steps.every_n_train_steps=20000 \
-  algo.gamma_min=-5. \
+  algo.t_max=0.95 \
+  algo.cond_t='log_nsr' \
+  algo.gamma_min=-4. \
   algo.gamma_max=5. \
   algo.train_loss='ce' \
-  algo.train_on_weighted_loss=True
+  algo.train_on_weighted_loss=True \
+  hydra.run.dir=${REPO_ROOT}/outputs/lm1b/${RUN_NAME}

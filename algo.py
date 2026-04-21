@@ -1088,69 +1088,210 @@ class FLMVDM(FLM):
         super().__init__(config, tokenizer)
         getattr(config.algo, 'interpolant_type', 'flm_linear')
 
+        self.cond_t = getattr(config.algo, 'cond_t', 'tau')
         self.gamma_min = getattr(config.algo, 'gamma_min', -5.)
         self.gamma_max = getattr(config.algo, 'gamma_max', 5.)
         self.train_loss = getattr(config.algo, 'train_loss', 'ce')
         self.train_on_weighted_loss = getattr(config.algo, 'train_on_weighted_loss', True)
+        self.diagnostic_num_bins = getattr(config.algo, 'diagnostic_num_bins', 8)
+
+    def _log_stage_metric(self, stage, name, value, group=None):
+        if torch.is_tensor(value):
+            value = value.detach()
+        if group is None:
+            metric_name = f'{stage}/{name}'
+        else:
+            metric_name = f'{stage}_{group}/{name}'
+        self.log(metric_name,
+                 value,
+                 on_step=self.training,
+                 on_epoch=not self.training,
+                 sync_dist=True)
+
+    def _log_distribution_stats(self, stage, name, values, group=None):
+        values = values.detach().float().reshape(-1)
+        if values.numel() == 0:
+            return
+
+        self._log_stage_metric(stage, f'{name}_mean', values.mean(),
+                               group=group)
+        self._log_stage_metric(stage, f'{name}_median', values.median(),
+                               group=group)
+        quantiles = torch.quantile(
+            values, torch.tensor([0.9, 0.99], device=values.device))
+        self._log_stage_metric(stage, f'{name}_p90', quantiles[0],
+                               group=group)
+        self._log_stage_metric(stage, f'{name}_p99', quantiles[1],
+                               group=group)
+        self._log_stage_metric(stage, f'{name}_max', values.max(),
+                               group=group)
+
+    def _log_weight_diagnostics(self, stage, t, gamma, snr_prime_t,
+                                dt_dtau, loss_weight):
+        self._log_distribution_stats(stage, 't', t, group='stats')
+        self._log_distribution_stats(stage, 'gamma', gamma, group='stats')
+        self._log_distribution_stats(stage, 'snr_prime_t', snr_prime_t,
+                                     group='stats')
+        self._log_distribution_stats(stage, 'dt_dtau', dt_dtau, group='stats')
+        self._log_distribution_stats(stage, 'loss_weight', loss_weight,
+                                     group='stats')
+
+        weight_sum = loss_weight.sum().clamp_min(1e-12)
+        ess = weight_sum.square() / loss_weight.square().sum().clamp_min(1e-12)
+        self._log_stage_metric(stage, 'loss_weight_ess', ess, group='stats')
+        self._log_stage_metric(stage, 'loss_weight_ess_frac',
+                               ess / max(loss_weight.numel(), 1),
+                               group='stats')
+
+    def _log_objective_diagnostics(self, stage, t, target_data,
+                                   log_softmax_pred, loss_weight):
+        probs = log_softmax_pred.exp()
+        ce_loss = -(target_data * log_softmax_pred).sum(dim=-1)
+        l2_loss = ((target_data - probs) ** 2).sum(dim=-1)
+        true_token_prob = (target_data * probs).sum(dim=-1)
+        pred_tokens = log_softmax_pred.argmax(dim=-1)
+        target_tokens = target_data.argmax(dim=-1)
+        token_accuracy = (pred_tokens == target_tokens).float()
+
+        broadcast_weight = loss_weight.expand_as(ce_loss)
+        weight_sum = broadcast_weight.sum().clamp_min(1e-12)
+
+        self._log_stage_metric(
+            stage, 'ce_weighted_normalized',
+            (ce_loss * broadcast_weight).sum() / weight_sum,
+            group='objective')
+        self._log_stage_metric(
+            stage, 'l2_weighted_normalized',
+            (0.5 * l2_loss * broadcast_weight).sum() / weight_sum,
+            group='objective')
+        self._log_stage_metric(stage, 'token_accuracy',
+                               token_accuracy.mean(),
+                               group='objective')
+        self._log_stage_metric(
+            stage, 'token_accuracy_weighted_normalized',
+            (token_accuracy * broadcast_weight).sum() / weight_sum,
+            group='objective')
+        self._log_stage_metric(stage, 'true_token_prob_mean',
+                               true_token_prob.mean(),
+                               group='objective')
+        self._log_distribution_stats(stage, 'true_token_prob',
+                                     true_token_prob,
+                                     group='objective')
+
+        if self.training:
+            return
+
+        ce_per_sample = ce_loss.mean(dim=-1)
+        weighted_ce_per_sample = ce_per_sample * loss_weight.squeeze(-1)
+        token_accuracy_per_sample = token_accuracy.mean(dim=-1)
+        num_bins = max(int(self.diagnostic_num_bins), 1)
+        edges = torch.linspace(0.0, 1.0, num_bins + 1, device=t.device)
+        bin_ids = torch.bucketize(t.detach(), edges[1:-1])
+
+        zero = t.new_tensor(0.0)
+        for bin_idx in range(num_bins):
+            mask = bin_ids == bin_idx
+            if mask.any():
+                self._log_stage_metric(
+                    stage, f't_bin_{bin_idx}_frac',
+                    mask.float().mean(),
+                    group='objective')
+                self._log_stage_metric(
+                    stage, f't_bin_{bin_idx}_mean',
+                    t[mask].mean(),
+                    group='objective')
+                self._log_stage_metric(
+                    stage, f't_bin_{bin_idx}_ce',
+                    ce_per_sample[mask].mean(),
+                    group='objective')
+                self._log_stage_metric(
+                    stage, f't_bin_{bin_idx}_weight',
+                    loss_weight.squeeze(-1)[mask].mean(),
+                    group='objective')
+                self._log_stage_metric(
+                    stage, f't_bin_{bin_idx}_weighted_ce',
+                    weighted_ce_per_sample[mask].mean(),
+                    group='objective')
+                self._log_stage_metric(
+                    stage, f't_bin_{bin_idx}_accuracy',
+                    token_accuracy_per_sample[mask].mean(),
+                    group='objective')
+            else:
+                self._log_stage_metric(stage, f't_bin_{bin_idx}_frac', zero,
+                                       group='objective')
+                self._log_stage_metric(stage, f't_bin_{bin_idx}_mean', zero,
+                                       group='objective')
+                self._log_stage_metric(stage, f't_bin_{bin_idx}_ce', zero,
+                                       group='objective')
+                self._log_stage_metric(stage, f't_bin_{bin_idx}_weight', zero,
+                                       group='objective')
+                self._log_stage_metric(
+                    stage, f't_bin_{bin_idx}_weighted_ce', zero,
+                    group='objective')
+                self._log_stage_metric(stage, f't_bin_{bin_idx}_accuracy', zero,
+                                       group='objective')
     
-    def corrupt_continuous(self, x0, t, dt_dtau, stage):
-        t = t.unsqueeze(-1).unsqueeze(-1)
+    def corrupt_continuous(self, x0, tau_t, t, stage):
         target_data = F.one_hot(x0, self.vocab_size).float()
         noise = torch.randn_like(target_data, dtype=torch.float32)
 
         gamma = self.gamma_max + (self.gamma_min - self.gamma_max) * t
-        # SNR(t) = alpha^2 / sigma^2 = sigmoid(-gamma) / sigmoid(gamma) = exp(-gamma)
-        # SNR'(t) = exp(-gamma) * dgamma/dt (first two terms below)
-        # SNR'(tau) = SNR'(t) * dt/dtau
-        loss_weight = torch.exp(-gamma) * (self.gamma_max - self.gamma_min) * dt_dtau.unsqueeze(-1).unsqueeze(-1)
+        # Under the VP parameterization below, SNR(t) = exp(-gamma(t)).
+        # Since gamma(t) is linear in FLM time, SNR'(t) is exp(-gamma(t))
+        # times the constant slope (gamma_max - gamma_min).
+        snr_prime_t = torch.exp(-gamma) * (self.gamma_max - self.gamma_min)
+        dt_dtau = utils.d_alpha_to_gamma(tau_t, self.lut_a2g)
+        loss_weight = snr_prime_t * dt_dtau
 
-        alpha = torch.sigmoid(-gamma).sqrt()
-        sigma = torch.sigmoid(gamma).sqrt()
-        self.log(name=f'{stage}/gamma',
-                 value=gamma.mean().item(),
-                 on_step=True,
-                 on_epoch=False,
-                 sync_dist=True)
-        self.log(name=f'{stage}/alpha',
-                 value=alpha.mean().item(),
-                 on_step=True,
-                 on_epoch=False,
-                 sync_dist=True)
-        self.log(name=f'{stage}/sigma',
-                 value=sigma.mean().item(),
-                 on_step=True,
-                 on_epoch=False,
-                 sync_dist=True)
+        alpha = torch.sigmoid(-gamma).sqrt().unsqueeze(-1).unsqueeze(-1)
+        sigma = torch.sigmoid(gamma).sqrt().unsqueeze(-1).unsqueeze(-1)
+        self._log_stage_metric(stage, 'alpha_mean', alpha.mean(),
+                               group='stats')
+        self._log_stage_metric(stage, 'sigma_mean', sigma.mean(),
+                               group='stats')
 
         x_t = alpha * target_data + sigma * noise
-        return x_t, target_data, loss_weight.squeeze(-1)
+        diagnostics = {
+            't': t,
+            'gamma': gamma,
+            'snr_prime_t': snr_prime_t,
+            'dt_dtau': dt_dtau,
+            'loss_weight': loss_weight,
+        }
+        if self.cond_t == 'tau':
+            cond_t = tau_t
+        elif self.cond_t == 't':
+            cond_t = t
+        elif self.cond_t == 'snr':
+            cond_t = torch.exp(-gamma)
+        elif self.cond_t == 'log_snr':
+            cond_t = -gamma
+        elif self.cond_t == 'nsr':
+            cond_t = torch.exp(gamma)
+        elif self.cond_t == 'log_nsr':
+            cond_t = gamma
+        else:
+            raise ValueError(f"Unknown cond_t: {self.cond_t}")
+        return x_t, cond_t, target_data, loss_weight.unsqueeze(-1), diagnostics
     
     def _ce_loss(self, target_data, log_softmax_pred, loss_weight, stage):
         loss = -(target_data * log_softmax_pred).sum(dim=-1)
-        self.log(f'{stage}/ce_unweighted',
-                 loss.mean().detach(),
-                 on_step=self.training,
-                 on_epoch=not self.training,
-                 sync_dist=True)        
-        self.log(f'{stage}/ce_weighted',
-                (loss * loss_weight).mean().detach(),
-                 on_step=self.training,
-                 on_epoch=not self.training,
-                 sync_dist=True)
+        self._log_stage_metric(stage, 'ce_unweighted',
+                               loss.mean().detach(),
+                               group='objective')
+        self._log_stage_metric(stage, 'ce_weighted',
+                               (loss * loss_weight).mean().detach(),
+                               group='objective')
         return loss, loss_weight
 
     def _l2_loss(self, target_data, log_softmax_pred, loss_weight, stage):
         loss = ((target_data - log_softmax_pred.exp()) ** 2).sum(dim=-1)
-        self.log(f'{stage}/l2_unweighted',
-                 loss.mean().detach(),
-                 on_step=self.training,
-                 on_epoch=not self.training,
-                 sync_dist=True)
-        self.log(f'{stage}/l2_weighted',
-                (0.5 * loss * loss_weight).mean().detach(),
-                 on_step=self.training,
-                 on_epoch=not self.training,
-                 sync_dist=True)
+        self._log_stage_metric(stage, 'l2_unweighted',
+                               loss.mean().detach(),
+                               group='objective')
+        self._log_stage_metric(stage, 'l2_weighted',
+                               (0.5 * loss * loss_weight).mean().detach(),
+                               group='objective')
         return loss, 0.5 * loss_weight
     
     def loss(self, x0, output_tokens,
@@ -1162,10 +1303,13 @@ class FLMVDM(FLM):
         tau_t = self._sample_t_interval(B, current_accumulation_step,
                                     t_min=self.t_min, t_max=self.t_max)
         t = self._tau_to_t(tau_t)
-        dt_dtau = utils.d_alpha_to_gamma(tau_t, self.lut_a2g)
 
-        x_t, target_data, loss_weight = self.corrupt_continuous(x0, t, dt_dtau, stage)
-        f = self.forward(x_t, tau_t) #condition on tau_t        
+        x_t, cond_t, target_data, loss_weight, diagnostics = self.corrupt_continuous(
+            x0, tau_t, t, stage)
+        f = self.forward(x_t, cond_t)
+        self._log_weight_diagnostics(stage, **diagnostics)
+        self._log_objective_diagnostics(stage, diagnostics['t'],
+                                        target_data, f, loss_weight)
         if self.train_loss == 'ce':
             with torch.no_grad():
                 _, _ = self._l2_loss(target_data, f, loss_weight, stage)
