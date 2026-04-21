@@ -46,3 +46,6 @@ hf_upload/
 # OS
 .DS_Store
 Thumbs.db
+
+.hf_cache
+*watch_folder*
