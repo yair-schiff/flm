@@ -1081,7 +1081,108 @@ class FLM(FLMBase):
             z = z + dt.view(-1, 1, 1) * v
 
         return z.argmax(dim=-1)
+
+
+class FLMVDM(FLM):
+    def __init__(self, config, tokenizer):
+        super().__init__(config, tokenizer)
+        getattr(config.algo, 'interpolant_type', 'flm_linear')
+
+        self.gamma_min = getattr(config.algo, 'gamma_min', -5.)
+        self.gamma_max = getattr(config.algo, 'gamma_max', 5.)
+        self.train_loss = getattr(config.algo, 'train_loss', 'ce')
+        self.train_on_weighted_loss = getattr(config.algo, 'train_on_weighted_loss', True)
     
+    def corrupt_continuous(self, x0, t, dt_dtau, stage):
+        t = t.unsqueeze(-1).unsqueeze(-1)
+        target_data = F.one_hot(x0, self.vocab_size).float()
+        noise = torch.randn_like(target_data, dtype=torch.float32)
+
+        gamma = self.gamma_max + (self.gamma_min - self.gamma_max) * t
+        # SNR(t) = alpha^2 / sigma^2 = sigmoid(-gamma) / sigmoid(gamma) = exp(-gamma)
+        # SNR'(t) = exp(-gamma) * dgamma/dt (first two terms below)
+        # SNR'(tau) = SNR'(t) * dt/dtau
+        loss_weight = torch.exp(-gamma) * (self.gamma_max - self.gamma_min) * dt_dtau.unsqueeze(-1).unsqueeze(-1)
+
+        alpha = torch.sigmoid(-gamma).sqrt()
+        sigma = torch.sigmoid(gamma).sqrt()
+        self.log(name=f'{stage}/gamma',
+                 value=gamma.mean().item(),
+                 on_step=True,
+                 on_epoch=False,
+                 sync_dist=True)
+        self.log(name=f'{stage}/alpha',
+                 value=alpha.mean().item(),
+                 on_step=True,
+                 on_epoch=False,
+                 sync_dist=True)
+        self.log(name=f'{stage}/sigma',
+                 value=sigma.mean().item(),
+                 on_step=True,
+                 on_epoch=False,
+                 sync_dist=True)
+
+        x_t = alpha * target_data + sigma * noise
+        return x_t, target_data, loss_weight.squeeze(-1)
+    
+    def _ce_loss(self, target_data, log_softmax_pred, loss_weight, stage):
+        loss = -(target_data * log_softmax_pred).sum(dim=-1)
+        self.log(f'{stage}/ce_unweighted',
+                 loss.mean().detach(),
+                 on_step=self.training,
+                 on_epoch=not self.training,
+                 sync_dist=True)        
+        self.log(f'{stage}/ce_weighted',
+                (loss * loss_weight).mean().detach(),
+                 on_step=self.training,
+                 on_epoch=not self.training,
+                 sync_dist=True)
+        return loss, loss_weight
+
+    def _l2_loss(self, target_data, log_softmax_pred, loss_weight, stage):
+        loss = ((target_data - log_softmax_pred.exp()) ** 2).sum(dim=-1)
+        self.log(f'{stage}/l2_unweighted',
+                 loss.mean().detach(),
+                 on_step=self.training,
+                 on_epoch=not self.training,
+                 sync_dist=True)
+        self.log(f'{stage}/l2_weighted',
+                (0.5 * loss * loss_weight).mean().detach(),
+                 on_step=self.training,
+                 on_epoch=not self.training,
+                 sync_dist=True)
+        return loss, 0.5 * loss_weight
+    
+    def loss(self, x0, output_tokens,
+             current_accumulation_step=None, train_mode=False,
+             xT=None, given_t=None, not_sampling_t=False):
+        del given_t, not_sampling_t, output_tokens
+        stage = 'train' if self.training else 'val'
+        B = x0.shape[0]
+        tau_t = self._sample_t_interval(B, current_accumulation_step,
+                                    t_min=self.t_min, t_max=self.t_max)
+        t = self._tau_to_t(tau_t)
+        dt_dtau = utils.d_alpha_to_gamma(tau_t, self.lut_a2g)
+
+        x_t, target_data, loss_weight = self.corrupt_continuous(x0, t, dt_dtau, stage)
+        f = self.forward(x_t, tau_t) #condition on tau_t        
+        if self.train_loss == 'ce':
+            with torch.no_grad():
+                _, _ = self._l2_loss(target_data, f, loss_weight, stage)
+            loss, loss_weight = self._ce_loss(target_data, f, loss_weight, stage)
+        elif self.train_loss == 'l2':
+            with torch.no_grad():
+                _, _ = self._ce_loss(target_data, f, loss_weight, stage)
+            loss, loss_weight = self._l2_loss(target_data, f, loss_weight, stage)
+        else:
+            raise NotImplementedError(f"Train loss {self.train_loss} not implemented!")
+        self.log('loss', loss.mean(), prog_bar=True)
+        if self.train_on_weighted_loss is True:
+            loss = loss * loss_weight
+            self.log('loss_weighted', loss.mean(), prog_bar=True)
+        return loss
+
+
 class FMLM(FLMBase):
     def __init__(self, config, tokenizer):
         super().__init__(config, tokenizer)

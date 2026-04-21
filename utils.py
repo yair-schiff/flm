@@ -631,5 +631,20 @@ def gamma_to_alpha(gamma: Union[np.ndarray, torch.tensor], lut: CubicSpline) -> 
     else:
         return np.clip(lut(gamma), 0.0, 1.0)
     
-    
-    
+
+def d_alpha_to_gamma(alpha: Union[np.ndarray, torch.Tensor], lut: CubicSpline) -> Union[np.ndarray, torch.Tensor]:
+    """
+    Derivative of the Alpha -> Gamma spline map.
+    If t = alpha_to_gamma(alpha), returns dt/dalpha.
+    """
+    lut_prime = lut.derivative()
+
+    if isinstance(alpha, torch.Tensor):
+        dtype = alpha.dtype
+        device = alpha.device
+        alpha_np = alpha.detach().cpu().numpy()
+        deriv = lut_prime(alpha_np)
+        deriv = np.asarray(deriv)
+        return torch.from_numpy(deriv).to(device=device, dtype=dtype)
+    else:
+        return lut_prime(alpha)
