@@ -1089,6 +1089,7 @@ class FLMVDM(FLM):
         getattr(config.algo, 'interpolant_type', 'flm_linear')
 
         self.cond_t = getattr(config.algo, 'cond_t', 'tau')
+        self.time_sampling = getattr(config.algo, 'time_sampling', 'warped_tau')
         self.gamma_min = getattr(config.algo, 'gamma_min', -5.)
         self.gamma_max = getattr(config.algo, 'gamma_max', 5.)
         self.train_loss = getattr(config.algo, 'train_loss', 'ce')
@@ -1231,7 +1232,7 @@ class FLMVDM(FLM):
                 self._log_stage_metric(stage, f't_bin_{bin_idx}_accuracy', zero,
                                        group='objective')
     
-    def corrupt_continuous(self, x0, tau_t, t, stage):
+    def corrupt_continuous(self, x0, tau_t, t, dt_dtau, stage):
         target_data = F.one_hot(x0, self.vocab_size).float()
         noise = torch.randn_like(target_data, dtype=torch.float32)
 
@@ -1240,7 +1241,6 @@ class FLMVDM(FLM):
         # Since gamma(t) is linear in FLM time, SNR'(t) is exp(-gamma(t))
         # times the constant slope (gamma_max - gamma_min).
         snr_prime_t = torch.exp(-gamma) * (self.gamma_max - self.gamma_min)
-        dt_dtau = utils.d_alpha_to_gamma(tau_t, self.lut_a2g)
         loss_weight = snr_prime_t * dt_dtau
 
         alpha = torch.sigmoid(-gamma).sqrt().unsqueeze(-1).unsqueeze(-1)
@@ -1294,18 +1294,31 @@ class FLMVDM(FLM):
                                group='objective')
         return loss, 0.5 * loss_weight
     
+    def _sample_training_times(self, B, accum_step):
+        if self.time_sampling == "warped_tau":
+            tau_t = self._sample_t_interval(B, accum_step,
+                                            t_min=self.t_min, t_max=self.t_max)
+            t = self._tau_to_t(tau_t)
+            dt_dtau = utils.d_alpha_to_gamma(tau_t, self.lut_a2g)
+        elif self.time_sampling == "uniform_t":
+            tau_t = self._sample_t_interval(B, accum_step,
+                                        t_min=self.t_min, t_max=self.t_max)
+            t = tau_t
+            dt_dtau = torch.ones_like(t)
+        else:
+            raise ValueError(...)
+        return tau_t, t, dt_dtau
+
     def loss(self, x0, output_tokens,
              current_accumulation_step=None, train_mode=False,
              xT=None, given_t=None, not_sampling_t=False):
         del given_t, not_sampling_t, output_tokens
         stage = 'train' if self.training else 'val'
         B = x0.shape[0]
-        tau_t = self._sample_t_interval(B, current_accumulation_step,
-                                    t_min=self.t_min, t_max=self.t_max)
-        t = self._tau_to_t(tau_t)
+        tau_t, t, dt_dtau = self._sample_training_times(B, current_accumulation_step)
 
         x_t, cond_t, target_data, loss_weight, diagnostics = self.corrupt_continuous(
-            x0, tau_t, t, stage)
+            x0, tau_t, t, dt_dtau, stage)
         f = self.forward(x_t, cond_t)
         self._log_weight_diagnostics(stage, **diagnostics)
         self._log_objective_diagnostics(stage, diagnostics['t'],

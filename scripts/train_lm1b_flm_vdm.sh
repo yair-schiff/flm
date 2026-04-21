@@ -43,8 +43,8 @@ export NPROC="${NPROC:-$(python -c 'import torch; print(torch.cuda.device_count(
 torchrun --nnodes=$NUM_NODES --nproc_per_node=$NPROC --master_port=$MASTER_PORT --master_addr $MASTER_ADDR --node_rank=$CURRENT_RANK main.py \
   trainer.num_nodes=$NUM_NODES \
   loader.global_batch_size=512 \
-  loader.batch_size=64 \
-  loader.eval_batch_size=64 \
+  loader.batch_size=128 \
+  loader.eval_batch_size=128 \
   data=lm1b-wrap \
   data.cache_dir=$DATA_DIR \
   wandb.project=lm1b_full \
@@ -60,7 +60,8 @@ torchrun --nnodes=$NUM_NODES --nproc_per_node=$NPROC --master_port=$MASTER_PORT 
   trainer.val_check_interval=5000 \
   algo.double_temb=False \
   callbacks.checkpoint_every_n_steps.every_n_train_steps=20000 \
-  algo.t_max=0.95 \
+  algo.time_sampling='uniform_t' \
+  algo.t_max=1.0 \
   algo.cond_t='log_nsr' \
   algo.gamma_min=-4. \
   algo.gamma_max=5. \
