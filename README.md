@@ -40,11 +40,25 @@ FLM applies the benefits of continuous image generation to discrete state spaces
 
 ### Install Dependencies
 
+Recommended cluster / workstation path:
+
+```bash
+chmod +x scripts/bootstrap_env.sh scripts/verify_env.sh
+scripts/bootstrap_env.sh
+scripts/verify_env.sh
+```
+
+This installs the project into the `flm_og` conda env prefix by default and
+includes an env-local `cuda-nvcc` so `flash-attn` can be built reliably.
+
+Manual path:
+
 ```bash
 pip install torch>=2.3.0
 pip install -r requirements.txt
 # Install flash-attn separately matching your python / torch version (see https://github.com/Dao-AILab/flash-attention/releases)
-pip install flash-attn==2.8.3 --no-build-isolation
+CUDA_HOME="$CONDA_PREFIX" PATH="$CONDA_PREFIX/bin:$PATH" \
+PIP_NO_CACHE_DIR=1 pip install flash-attn==2.8.3 --no-build-isolation --no-cache-dir
 ```
 
 Our DiT backbone supports `torch.compile` with `max-autotune` for faster training. Enable it by setting the environment variable before running any script:
@@ -54,6 +68,9 @@ export DIT_USE_COMPILE=TRUE
 ```
 
 With the option, we are able to train OpenWebText experiments with 512 batch size on 8 H100 (80GB VRAM), with local batch size of 32.
+
+When using the provided launch scripts, `setup_env.sh` will activate `flm_og`
+by default unless `FLM_CONDA_ENV` is set explicitly.
 
 ### Training
 

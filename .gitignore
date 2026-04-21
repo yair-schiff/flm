@@ -50,4 +50,5 @@ Thumbs.db
 # HF
 .hf_cache
 
+watch_folder/
 scripts/watch_folder

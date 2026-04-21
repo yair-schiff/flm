@@ -11,15 +11,12 @@ import rich.syntax
 import rich.tree
 import torch
 torch.load = functools.partial(torch.load, weights_only=False)
-from torch.distributed import init_process_group, destroy_process_group
-import wandb
 import algo
 import dataloader
 import utils
 
 import numpy as np
 from datetime import datetime
-
 import uuid
 
 # Allow torch.load(weights_only=True) to safely unpickle Hydra configs stored in checkpoints
@@ -33,6 +30,43 @@ omegaconf.OmegaConf.register_new_resolver(
     'eval', eval)
 omegaconf.OmegaConf.register_new_resolver(
     'div_up', lambda x, y: (x + y - 1) // y)
+
+def _get_global_rank():
+    for key in ('RANK', 'SLURM_PROCID'):
+        value = os.environ.get(key)
+        if value is not None:
+            try:
+                return int(value)
+            except ValueError:
+                continue
+    return 0
+
+def _build_wandb_logger(config):
+    if config.get('wandb', None) is None:
+        return None
+    if _get_global_rank() != 0:
+        return None
+
+    wid = config.wandb.get('id', None)
+    if not wid or len(str(wid)) > 16:
+        wid = str(uuid.uuid4().hex[:8])
+        config.wandb.id = wid
+
+    wname = config.wandb.get('name', None)
+    if wname:
+        config.wandb.name = f'{wname}_{wid}'
+
+    return L.pytorch.loggers.WandbLogger(
+        config=omegaconf.OmegaConf.to_object(config),
+        **config.wandb)
+
+
+def _resolve_trainer_logger(config, wandb_logger):
+    if wandb_logger is not None:
+        return wandb_logger
+    if 'trainer' in config and isinstance(config.trainer, omegaconf.DictConfig):
+        return config.trainer.get('logger', None)
+    return None
 
 
 def _load_from_checkpoint(diffusion_model, config, tokenizer):
@@ -263,11 +297,7 @@ def _eval_ppl(diffusion_model, config, logger, tokenizer):
         logger.info('Disabling EMA.')
         model.ema = None
 
-    wandb_logger = None
-    if config.get('wandb', None) is not None:
-        wandb_logger = L.pytorch.loggers.WandbLogger(
-            config=omegaconf.OmegaConf.to_object(config),
-            ** config.wandb)
+    wandb_logger = _build_wandb_logger(config)
     callbacks = []
     if 'callbacks' in config:
         for _, callback in config.callbacks.items():
@@ -277,7 +307,7 @@ def _eval_ppl(diffusion_model, config, logger, tokenizer):
         default_root_dir=os.getcwd(),
         callbacks=callbacks,
         strategy=hydra.utils.instantiate(config.strategy),
-        logger=wandb_logger)
+        logger=_resolve_trainer_logger(config, wandb_logger))
     _, valid_ds = dataloader.get_dataloaders(
         config, tokenizer, skip_train=True, valid_seed=config.seed)
     trainer.validate(model, valid_ds)
@@ -359,17 +389,7 @@ def generate_reflow_dataset_with_perturbed_rect(diffusion_model, config, logger,
 
 def _train(diffusion_model, config, logger, tokenizer):
     logger.info('Starting Training.')
-    wandb_logger = None
-    if config.get('wandb', None) is not None:
-        wid = config.wandb.get('id')
-        if not wid or len(str(wid)) > 16:
-            wid = str(uuid.uuid4().hex[:8])
-        config.wandb.id = wid
-        if config.wandb.get('name'):
-            config.wandb.name = f"{config.wandb.name}_{wid}"
-        wandb_logger = L.pytorch.loggers.WandbLogger(
-            config=omegaconf.OmegaConf.to_object(config),
-            ** config.wandb)
+    wandb_logger = _build_wandb_logger(config)
 
     if (config.checkpointing.resume_from_ckpt
         and config.checkpointing.resume_ckpt_path is not None
@@ -405,7 +425,7 @@ def _train(diffusion_model, config, logger, tokenizer):
         default_root_dir=os.getcwd(),
         callbacks=callbacks,
         strategy=hydra.utils.instantiate(config.strategy),
-        logger=wandb_logger)
+        logger=_resolve_trainer_logger(config, wandb_logger))
     # Force weights_only=False to allow full checkpoint restore (PyTorch 2.6 defaults torch.load to weights_only=True)
     trainer.fit(model, train_ds, valid_ds, ckpt_path=ckpt_path)
 

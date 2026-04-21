@@ -1,13 +1,13 @@
 #!/bin/bash
-# Full eight-GPU fine-tune launcher.
-# Use train_lm1b_flm_vp_8gpu_gate.sh first; once that is stable, this is the long run.
+# Conservative eight-GPU gate run.
+# Start here before turning the full eight-GPU fine-tune loose for a long duration.
 
-#SBATCH -J ft_lm1b_flm_vp
+#SBATCH -J lm1b_vp_8gpu_gate
 #SBATCH -o watch_folder/%x_%j.out
 #SBATCH -N 1
 #SBATCH --get-user-env
 #SBATCH --mem=180000
-#SBATCH -t 48:00:00
+#SBATCH -t 08:00:00
 #SBATCH --partition=kuleshov
 #SBATCH --constraint="a5000"
 #SBATCH --ntasks-per-node=8
@@ -25,7 +25,7 @@ export FLM_WANDB_CACHE_DIR="${FLM_WANDB_CACHE_DIR:-${DATA_DIR}/wandb-cache}"
 
 REPO_ROOT="${FLM_REPO_ROOT:-/share/kuleshov/yzs2/flm-og}"
 RUN_SUFFIX="${RUN_SUFFIX:-${SLURM_JOB_ID:-manual}}"
-RUN_BASE_NAME="${RUN_BASE_NAME:-lm1b_vp_flm_weight_matched_8gpu}"
+RUN_BASE_NAME="${RUN_BASE_NAME:-lm1b_vp_8gpu_gate}"
 RUN_ID="${RUN_ID:-$(printf '%s' "${RUN_SUFFIX}" | sha1sum | cut -c1-8)}"
 RUN_NAME="${RUN_NAME:-${RUN_BASE_NAME}_${RUN_ID}}"
 
@@ -65,11 +65,11 @@ srun --gpu-bind=closest python -u -m main \
   eval.generate_samples=false \
   eval.compute_generative_perplexity=false \
   trainer.num_sanity_val_steps=0 \
-  trainer.max_steps=1000000 \
-  trainer.val_check_interval=5000 \
+  trainer.max_steps=1000 \
+  trainer.val_check_interval=250 \
   trainer.num_nodes=1 \
   trainer.devices=8 \
-  callbacks.checkpoint_every_n_steps.every_n_train_steps=5000 \
+  callbacks.checkpoint_every_n_steps.every_n_train_steps=250 \
   checkpointing.monitor_metric=val/ce_upper_bound \
   optim.lr=1e-4 \
   trainer.precision=bf16 \

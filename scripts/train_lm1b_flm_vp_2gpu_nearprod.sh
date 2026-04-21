@@ -1,19 +1,17 @@
 #!/bin/bash
-# Full eight-GPU fine-tune launcher.
-# Use train_lm1b_flm_vp_8gpu_gate.sh first; once that is stable, this is the long run.
+# Near-production two-GPU fine-tune run.
+# Keep this aligned with the proof recipe and only scale duration/checkpointing.
 
-#SBATCH -J ft_lm1b_flm_vp
+#SBATCH -J lm1b_vp_2gpu_run
 #SBATCH -o watch_folder/%x_%j.out
 #SBATCH -N 1
 #SBATCH --get-user-env
-#SBATCH --mem=180000
+#SBATCH --mem=80000
 #SBATCH -t 48:00:00
 #SBATCH --partition=kuleshov
-#SBATCH --constraint="a5000"
-#SBATCH --ntasks-per-node=8
-#SBATCH --gres=gpu:8
-#SBATCH --cpus-per-task=1
-#SBATCH --gres-flags=enforce-binding
+#SBATCH --constraint="a5000|a6000"
+#SBATCH --ntasks-per-node=2
+#SBATCH --gres=gpu:2
 #SBATCH --open-mode=append
 #SBATCH --requeue
 
@@ -24,10 +22,6 @@ export FLM_WANDB_DIR="${FLM_WANDB_DIR:-${DATA_DIR}}"
 export FLM_WANDB_CACHE_DIR="${FLM_WANDB_CACHE_DIR:-${DATA_DIR}/wandb-cache}"
 
 REPO_ROOT="${FLM_REPO_ROOT:-/share/kuleshov/yzs2/flm-og}"
-RUN_SUFFIX="${RUN_SUFFIX:-${SLURM_JOB_ID:-manual}}"
-RUN_BASE_NAME="${RUN_BASE_NAME:-lm1b_vp_flm_weight_matched_8gpu}"
-RUN_ID="${RUN_ID:-$(printf '%s' "${RUN_SUFFIX}" | sha1sum | cut -c1-8)}"
-RUN_NAME="${RUN_NAME:-${RUN_BASE_NAME}_${RUN_ID}}"
 
 cd "${REPO_ROOT}" || exit
 source "${REPO_ROOT}/setup_env.sh" || exit
@@ -41,16 +35,15 @@ if [ "${WANDB_OFFLINE:-false}" != "true" ]; then
 fi
 export WANDB_CONSOLE WANDB_DISABLE_GIT WANDB_DISABLE_CODE
 
-srun --gpu-bind=closest python -u -m main \
+srun python -u -m main \
   loader.global_batch_size=128 \
-  loader.batch_size=8 \
+  loader.batch_size=16 \
   loader.eval_batch_size=8 \
   loader.num_workers=1 \
   data=lm1b-wrap \
   data.cache_dir=$DATA_DIR \
   wandb.project=lm1b_finetune \
-  wandb.name=${RUN_NAME} \
-  wandb.id=${RUN_ID} \
+  wandb.name=lm1b_vp_2gpu_nearprod \
   model=small \
   algo=flm \
   model.length=128 \
@@ -65,10 +58,10 @@ srun --gpu-bind=closest python -u -m main \
   eval.generate_samples=false \
   eval.compute_generative_perplexity=false \
   trainer.num_sanity_val_steps=0 \
-  trainer.max_steps=1000000 \
+  trainer.max_steps=50000 \
   trainer.val_check_interval=5000 \
   trainer.num_nodes=1 \
-  trainer.devices=8 \
+  trainer.devices=2 \
   callbacks.checkpoint_every_n_steps.every_n_train_steps=5000 \
   checkpointing.monitor_metric=val/ce_upper_bound \
   optim.lr=1e-4 \
