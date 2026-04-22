@@ -1096,6 +1096,21 @@ class FLMVDM(FLM):
         self.train_on_weighted_loss = getattr(config.algo, 'train_on_weighted_loss', True)
         self.diagnostic_num_bins = getattr(config.algo, 'diagnostic_num_bins', 8)
 
+    def _conditioning_from_gamma(self, tau_t, t, gamma):
+        if self.cond_t == 'tau':
+            return tau_t
+        if self.cond_t == 't':
+            return t
+        if self.cond_t == 'snr':
+            return torch.exp(-gamma)
+        if self.cond_t == 'log_snr':
+            return -gamma
+        if self.cond_t == 'nsr':
+            return torch.exp(gamma)
+        if self.cond_t == 'log_nsr':
+            return gamma
+        raise ValueError(f"Unknown cond_t: {self.cond_t}")
+
     def _log_stage_metric(self, stage, name, value, group=None):
         if torch.is_tensor(value):
             value = value.detach()
@@ -1258,20 +1273,7 @@ class FLMVDM(FLM):
             'dt_dtau': dt_dtau,
             'loss_weight': loss_weight,
         }
-        if self.cond_t == 'tau':
-            cond_t = tau_t
-        elif self.cond_t == 't':
-            cond_t = t
-        elif self.cond_t == 'snr':
-            cond_t = torch.exp(-gamma)
-        elif self.cond_t == 'log_snr':
-            cond_t = -gamma
-        elif self.cond_t == 'nsr':
-            cond_t = torch.exp(gamma)
-        elif self.cond_t == 'log_nsr':
-            cond_t = gamma
-        else:
-            raise ValueError(f"Unknown cond_t: {self.cond_t}")
+        cond_t = self._conditioning_from_gamma(tau_t, t, gamma)
         return x_t, cond_t, target_data, loss_weight.unsqueeze(-1), diagnostics
     
     def _ce_loss(self, target_data, log_softmax_pred, loss_weight, stage):
@@ -1338,6 +1340,66 @@ class FLMVDM(FLM):
             loss = loss * loss_weight
             self.log('loss_weighted', loss.mean(), prog_bar=True)
         return loss
+
+    @torch.no_grad()
+    def generate_samples(self, num_samples, num_steps=None, eps=1e-5):
+        """Generate samples with a deterministic Gaussian-path update."""
+        del eps
+        if num_steps is None:
+            num_steps = self.config.sampling.steps
+        if num_steps < 1:
+            raise ValueError("num_steps must be >= 1")
+
+        B = num_samples
+        V = self.vocab_size
+        L = self.num_tokens
+        device = self.device
+        sigma_floor = 1e-5
+
+        time_vals = torch.linspace(
+            self.t_min, self.t_max, num_steps + 1, device=device)
+        if self.time_sampling == "warped_tau":
+            tau_vals = time_vals
+            t_vals = self._tau_to_t(tau_vals)
+        elif self.time_sampling == "uniform_t":
+            t_vals = time_vals
+            tau_vals = time_vals
+        else:
+            raise ValueError(f"Unknown time_sampling: {self.time_sampling}")
+
+        gamma_start = (
+            self.gamma_max + (self.gamma_min - self.gamma_max) * t_vals[0]
+        )
+        sigma_start = torch.sigmoid(gamma_start).sqrt()
+        z = sigma_start * torch.randn(
+            (num_samples, L, V), device=device, dtype=self.dtype)
+
+        for i in range(num_steps):
+            tau_curr = tau_vals[i].expand(B)
+            tau_next = tau_vals[i + 1].expand(B)
+            t_curr = t_vals[i].expand(B)
+            t_next = t_vals[i + 1].expand(B)
+
+            gamma_curr = self.gamma_max + (self.gamma_min - self.gamma_max) * t_curr
+            alpha_curr = torch.sigmoid(-gamma_curr).sqrt().view(-1, 1, 1)
+            sigma_curr = torch.sigmoid(gamma_curr).sqrt().view(-1, 1, 1)
+            cond_curr = self._conditioning_from_gamma(tau_curr, t_curr, gamma_curr)
+
+            x_hat0 = self.forward(z, cond_curr).exp()
+            eps_hat = (
+                z - alpha_curr * x_hat0
+            ) / sigma_curr.clamp_min(sigma_floor)
+
+            gamma_next = self.gamma_max + (self.gamma_min - self.gamma_max) * t_next
+            alpha_next = torch.sigmoid(-gamma_next).sqrt().view(-1, 1, 1)
+            sigma_next = torch.sigmoid(gamma_next).sqrt().view(-1, 1, 1)
+            z = alpha_next * x_hat0 + sigma_next * eps_hat
+
+        tau_end = tau_vals[-1].expand(B)
+        t_end = t_vals[-1].expand(B)
+        gamma_end = self.gamma_max + (self.gamma_min - self.gamma_max) * t_end
+        cond_end = self._conditioning_from_gamma(tau_end, t_end, gamma_end)
+        return self.forward(z, cond_end).argmax(dim=-1)
 
 
 class FMLM(FLMBase):

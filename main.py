@@ -16,6 +16,7 @@ import wandb
 import algo
 import dataloader
 import utils
+from tqdm.auto import tqdm
 
 import numpy as np
 from datetime import datetime
@@ -115,7 +116,7 @@ def _generate_samples(diffusion_model, config, logger,
 
     print("generation start: " + datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 
-    for _ in range(config.sampling.num_sample_batches):
+    for _ in tqdm(range(config.sampling.num_sample_batches), desc='Generating samples'):
         if config.sampling.semi_ar:
             _, intermediate_samples, _ = model.restore_model_and_semi_ar_sample(
                 stride_length=stride_length,
