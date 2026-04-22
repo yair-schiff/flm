@@ -162,6 +162,8 @@ def compute_schedule(params: ScheduleParams) -> dict[str, np.ndarray | float]:
     sigma = np.sqrt(expit(gamma))
     snr_prime_t = snr #(params.gamma_max - params.gamma_min) * snr
     loss_weight = snr_prime_t * dt_dtau
+    one_minus_t = np.maximum(1.0 - t, 1e-12)
+    reweight_factor = 2.0 * t * dt_dtau / (one_minus_t ** 3)
     accuracy = standardized_progress_to_accuracy(tau, params.vocab_size)
     decoding_error = standardized_progress_to_error(tau, params.vocab_size)
     raw_uniform_t = np.linspace(params.tau_min, params.tau_max, params.plot_points, dtype=np.float64)
@@ -184,6 +186,7 @@ def compute_schedule(params: ScheduleParams) -> dict[str, np.ndarray | float]:
         "sigma": sigma,
         "snr_prime_t": snr_prime_t,
         "loss_weight": loss_weight,
+        "reweight_factor": reweight_factor,
         "accuracy": accuracy,
         "decoding_error": decoding_error,
         "raw_uniform_t": raw_uniform_t,
@@ -422,6 +425,48 @@ def build_noise_figure(schedule: dict[str, np.ndarray | float], log_scale: bool)
     return fig
 
 
+def build_weight_compare_figure(schedule: dict[str, np.ndarray | float], log_scale: bool) -> go.Figure:
+    fig = make_subplots(
+        rows=1,
+        cols=2,
+        subplot_titles=(
+            "Linear Scale",
+            "Log Scale",
+        ),
+        horizontal_spacing=0.10,
+    )
+
+    trace_specs = (
+        ("dt/dtau", schedule["dt_dtau"], {"width": 4}),
+        ("(2 * t * dt/dtau) / (1 - t)^3", schedule["reweight_factor"], {}),
+    )
+
+    for name, y, line in trace_specs:
+        fig.add_trace(
+            go.Scatter(x=schedule["tau"], y=y, name=name, line=line),
+            row=1,
+            col=1,
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=schedule["tau"],
+                y=y,
+                name=name,
+                line=line,
+                showlegend=False,
+            ),
+            row=1,
+            col=2,
+        )
+
+    fig.update_xaxes(title_text="tau", row=1, col=1)
+    fig.update_yaxes(title_text="value", row=1, col=1)
+    fig.update_xaxes(title_text="tau", row=1, col=2)
+    fig.update_yaxes(title_text="value", row=1, col=2, type="log" if log_scale else "linear")
+    fig.update_layout(height=460, legend={"orientation": "h", "y": -0.20})
+    return fig
+
+
 def build_vocab_figure(
     params: ScheduleParams,
     compare_vocab_sizes: list[int],
@@ -562,6 +607,11 @@ def main() -> None:
 
     with noise_tab:
         st.plotly_chart(build_noise_figure(schedule, log_scale=log_scale), use_container_width=True)
+        st.plotly_chart(build_weight_compare_figure(schedule, log_scale=log_scale), use_container_width=True)
+        st.caption(
+            "The extra factor `(2 * t * dt/dtau) / (1 - t)^3` goes to zero exactly at `tau=0`, "
+            "stays modest across the middle of the warp, and then grows sharply near `tau -> 1`."
+        )
         stats_col1, stats_col2 = st.columns(2)
         stats_col1.write(
             {
@@ -577,6 +627,8 @@ def main() -> None:
                 "dt_dtau_max": float(np.max(schedule["dt_dtau"])),
                 "loss_weight_min": float(np.min(schedule["loss_weight"])),
                 "loss_weight_max": float(np.max(schedule["loss_weight"])),
+                "reweight_factor_min": float(np.min(schedule["reweight_factor"])),
+                "reweight_factor_max": float(np.max(schedule["reweight_factor"])),
             }
         )
 

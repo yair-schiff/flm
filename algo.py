@@ -1054,6 +1054,9 @@ class FLM(FLMBase):
             loss_weight = loss_weight.unsqueeze(-1)
             loss = torch.exp(-loss_weight) * loss + loss_weight
             self.log('loss_weighted', loss.mean(), prog_bar=True)
+        # dt_dtau = utils.d_alpha_to_gamma(tau_t, self.lut_a2g)
+        # loss_weight = (2 * t * dt_dtau) / (1 - t)**3
+        # return loss * loss_weight[:, None]
         return loss
 
     @torch.no_grad()
