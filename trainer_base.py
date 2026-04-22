@@ -309,13 +309,22 @@ class TrainerBase(L.LightningModule):
     def _process_model_output(self, model_output, xt, sigma):
         raise NotImplementedError
 
-    def forward(self, xt, sigma, sigma_prime=None, use_jvp_attn=False):
+    def forward(self, xt, sigma, sigma_prime=None, use_jvp_attn=False,
+                self_cond=None):
 
         sigma = self._process_sigma(sigma)
         if sigma_prime is not None:
             sigma_prime = self._process_sigma(sigma_prime)
+        backbone_kwargs = {'use_jvp_attn': use_jvp_attn}
+        if self_cond is not None:
+            backbone_kwargs['self_cond'] = self_cond
         with torch.amp.autocast(device_type=self.device.type, dtype=torch.float32):
-            model_output = self.backbone(xt, sigma, sigma_prime, use_jvp_attn=use_jvp_attn)
+            model_output = self.backbone(
+                xt,
+                sigma,
+                sigma_prime,
+                **backbone_kwargs,
+            )
         
         return self._process_model_output(
             model_output=model_output, xt=xt, sigma=sigma)

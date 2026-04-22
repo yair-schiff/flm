@@ -154,13 +154,13 @@ def compute_schedule(params: ScheduleParams) -> dict[str, np.ndarray | float]:
     t = np.asarray(mapped["t_mixed"])
     dt_dtau = np.asarray(mapped["dt_dtau_mixed"])
 
-    gamma = params.gamma_max + (params.gamma_min - params.gamma_max) * t
+    gamma = -t #params.gamma_max + (params.gamma_min - params.gamma_max) * t
     snr = np.exp(-gamma)
     log_snr = -gamma
     nsr = np.exp(gamma)
     alpha = np.sqrt(expit(-gamma))
     sigma = np.sqrt(expit(gamma))
-    snr_prime_t = (params.gamma_max - params.gamma_min) * snr
+    snr_prime_t = snr #(params.gamma_max - params.gamma_min) * snr
     loss_weight = snr_prime_t * dt_dtau
     accuracy = standardized_progress_to_accuracy(tau, params.vocab_size)
     decoding_error = standardized_progress_to_error(tau, params.vocab_size)

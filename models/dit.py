@@ -566,9 +566,15 @@ class DIT(nn.Module, huggingface_hub.PyTorchModelHubMixin):
         self.adaLN = not self.causal
         self.config = config
         self.vocab_size = vocab_size
+        self.self_conditioning_cfg = getattr(config.algo, 'self_conditioning', None)
+        self.self_conditioning = bool(
+            getattr(self.self_conditioning_cfg, 'enabled', False))
         dim = config.model.hidden_size
         cond_dim = config.model.cond_dim
         self.vocab_embed = EmbeddingLayer(dim, vocab_size)
+        if self.self_conditioning:
+            self.self_cond_proj = nn.Linear(2 * dim, dim, bias=False)
+            self.self_cond_proj.weight.data.zero_()
         if not self.causal:
             self.sigma_map = TimestepEmbedder(cond_dim)
         if 'flm' in self.config.algo.name or 'fmlm' in self.config.algo.name:
@@ -635,8 +641,16 @@ class DIT(nn.Module, huggingface_hub.PyTorchModelHubMixin):
             return bias_dropout_add_scale_fused_inference
     
     @torch_compile_deco
-    def forward(self, x, sigma, sigma_prime=None, use_jvp_attn=False):
+    def forward(self, x, sigma, sigma_prime=None, use_jvp_attn=False,
+                self_cond=None):
         x = self.vocab_embed(x)
+        if self.self_conditioning:
+            if self_cond is None:
+                x_self_cond = torch.zeros_like(x)
+            else:
+                x_self_cond = self.vocab_embed(self_cond)
+            x = x + self.self_cond_proj(
+                torch.cat([x, x_self_cond], dim=-1))
             
         if self.causal:
             t_cond = None

@@ -928,12 +928,17 @@ class FLMBase(trainer_base.TrainerBase):
             new_state_dict[new_key] = v
         return new_state_dict
 
-    def forward_no_softmax(self, xt, tau, tau_prime=None, **kwargs):
+    def forward_no_softmax(self, xt, tau, tau_prime=None, self_cond=None,
+                           **kwargs):
         tau = self._process_sigma(tau)
         if tau_prime is not None:
             tau_prime = self._process_sigma(tau_prime)
+        backbone_kwargs = dict(kwargs)
+        if self_cond is not None:
+            backbone_kwargs['self_cond'] = self_cond
         with torch.amp.autocast(device_type=self.device.type, dtype=torch.float32):
-            model_output = self.backbone(xt, tau, tau_prime, **kwargs)
+            model_output = self.backbone(
+                xt, tau, tau_prime, **backbone_kwargs)
         return model_output
 
     def _extract_ema_state_dict(self, model, checkpoint):
@@ -1096,10 +1101,24 @@ class FLMVDM(FLM):
         self.train_loss = getattr(config.algo, 'train_loss', 'ce')
         self.train_on_weighted_loss = getattr(config.algo, 'train_on_weighted_loss', True)
         self.diagnostic_num_bins = getattr(config.algo, 'diagnostic_num_bins', 8)
+        self.self_conditioning_cfg = getattr(config.algo, 'self_conditioning', None)
+        self.self_conditioning_enabled = bool(
+            getattr(self.self_conditioning_cfg, 'enabled', False))
+        self.self_conditioning_train_prob = float(
+            getattr(self.self_conditioning_cfg, 'train_prob', 0.25))
         if not 0.0 <= self.warp_mix <= 1.0:
             raise ValueError(f"warp_mix must be in [0, 1], got {self.warp_mix}")
+        if not 0.0 <= self.self_conditioning_train_prob <= 1.0:
+            raise ValueError(
+                "self_conditioning.train_prob must be in [0, 1], "
+                f"got {self.self_conditioning_train_prob}")
+        if (self.self_conditioning_enabled
+                and self.config.algo.backbone != 'dit'):
+            raise NotImplementedError(
+                "FLM-VDM self-conditioning is only implemented for the DiT "
+                f"backbone, got {self.config.algo.backbone}")
 
-    def _conditioning_from_gamma(self, tau_t, t, gamma):
+    def _get_noise_conditioning(self, tau_t, t, gamma):
         if self.cond_t == 'tau':
             return tau_t
         if self.cond_t == 't':
@@ -1276,7 +1295,7 @@ class FLMVDM(FLM):
             'dt_dtau': dt_dtau,
             'loss_weight': loss_weight,
         }
-        cond_t = self._conditioning_from_gamma(tau_t, t, gamma)
+        cond_t = self._get_noise_conditioning(tau_t, t, gamma)
         return x_t, cond_t, target_data, loss_weight.unsqueeze(-1), diagnostics
     
     def _ce_loss(self, target_data, log_softmax_pred, loss_weight, stage):
@@ -1335,6 +1354,25 @@ class FLMVDM(FLM):
             raise ValueError(f"Unknown time_sampling: {self.time_sampling}")
         return tau_t, t, dt_dtau
 
+    def _build_self_conditioning(self, x_t, cond_t, self_cond_mask=None):
+        if not self.self_conditioning_enabled:
+            return None
+
+        if self_cond_mask is None:
+            with torch.no_grad():
+                return self.forward(x_t, cond_t).detach().exp()
+
+        self_cond = torch.zeros_like(x_t)
+        if not self_cond_mask.any():
+            return self_cond
+
+        with torch.no_grad():
+            self_cond[self_cond_mask] = self.forward(
+                x_t[self_cond_mask],
+                cond_t[self_cond_mask],
+            ).detach().exp()
+        return self_cond
+
     def loss(self, x0, output_tokens,
              current_accumulation_step=None, train_mode=False,
              xT=None, given_t=None, not_sampling_t=False):
@@ -1345,7 +1383,30 @@ class FLMVDM(FLM):
 
         x_t, cond_t, target_data, loss_weight, diagnostics = self.corrupt_continuous(
             x0, tau_t, t, dt_dtau, stage)
-        f = self.forward(x_t, cond_t)
+        self_cond = None
+        if self.self_conditioning_enabled:
+            if self.training:
+                self_cond_mask = (
+                    torch.rand(B, device=self.device)
+                    < self.self_conditioning_train_prob)
+                self_cond = self._build_self_conditioning(
+                    x_t, cond_t, self_cond_mask=self_cond_mask)
+                self._log_stage_metric(
+                    stage, 'selfcond_frac', self_cond_mask.float().mean(),
+                    group='stats')
+            else:
+                self_cond = self._build_self_conditioning(x_t, cond_t)
+                self._log_stage_metric(
+                    stage, 'selfcond_frac',
+                    x_t.new_tensor(1.0),
+                    group='stats')
+        else:
+            self._log_stage_metric(
+                stage, 'selfcond_frac',
+                x_t.new_tensor(0.0),
+                group='stats')
+
+        f = self.forward(x_t, cond_t, self_cond=self_cond)
         self._log_weight_diagnostics(stage, **diagnostics)
         self._log_objective_diagnostics(stage, diagnostics['t'],
                                         target_data, f, loss_weight)
@@ -1397,6 +1458,7 @@ class FLMVDM(FLM):
         sigma_start = torch.sigmoid(gamma_start).sqrt()
         z = sigma_start * torch.randn(
             (num_samples, L, V), device=device, dtype=self.dtype)
+        self_cond_probs = None
 
         for i in range(num_steps):
             tau_curr = tau_vals[i].expand(B)
@@ -1407,9 +1469,12 @@ class FLMVDM(FLM):
             gamma_curr = self.gamma_max + (self.gamma_min - self.gamma_max) * t_curr
             alpha_curr = torch.sigmoid(-gamma_curr).sqrt().view(-1, 1, 1)
             sigma_curr = torch.sigmoid(gamma_curr).sqrt().view(-1, 1, 1)
-            cond_curr = self._conditioning_from_gamma(tau_curr, t_curr, gamma_curr)
+            cond_curr = self._get_noise_conditioning(tau_curr, t_curr, gamma_curr)
 
-            x_hat0 = self.forward(z, cond_curr).exp()
+            x_hat0 = self.forward(
+                z, cond_curr, self_cond=self_cond_probs).exp()
+            if self.self_conditioning_enabled:
+                self_cond_probs = x_hat0.detach()
             eps_hat = (
                 z - alpha_curr * x_hat0
             ) / sigma_curr.clamp_min(sigma_floor)
@@ -1422,8 +1487,9 @@ class FLMVDM(FLM):
         tau_end = tau_vals[-1].expand(B)
         t_end = t_vals[-1].expand(B)
         gamma_end = self.gamma_max + (self.gamma_min - self.gamma_max) * t_end
-        cond_end = self._conditioning_from_gamma(tau_end, t_end, gamma_end)
-        return self.forward(z, cond_end).argmax(dim=-1)
+        cond_end = self._get_noise_conditioning(tau_end, t_end, gamma_end)
+        return self.forward(
+            z, cond_end, self_cond=self_cond_probs).argmax(dim=-1)
 
 
 class FMLM(FLMBase):
