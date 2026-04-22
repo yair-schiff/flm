@@ -2,27 +2,23 @@
 
 # Faithful preset for lm1b_full_flm_vdm_6:
 # CKPT_PATH="/share/kuleshov/yzs2/flm-og/outputs/lm1b/lm1b_full_flm_vdm_6/checkpoints/best_nll.ckpt"
-# EVAL_BATCH_SIZE=64
-# NUM_SAMPLE_BATCHES=1
 # TIME_SAMPLING=warped_tau
 # T_MAX=0.95
 #
 # Faithful preset for lm1b_full_flm_vdm_v7:
 # CKPT_PATH="/share/kuleshov/yzs2/flm-og/outputs/lm1b/lm1b_full_flm_vdm_v7/checkpoints/best_nll.ckpt"
-# EVAL_BATCH_SIZE=128
-# NUM_SAMPLE_BATCHES=1
 # TIME_SAMPLING=uniform_t
 # T_MAX=1.0
 
 # Active preset: v7
-CKPT_PATH="/share/kuleshov/yzs2/flm-og/outputs/lm1b/lm1b_full_flm_vdm_v7/checkpoints/best_nll.ckpt"
 STEPS=1024
 SEED=1
 DATA_DIR="${DATA_DIR:-/share/kuleshov/yzs2/data}"
-EVAL_BATCH_SIZE=128
-NUM_SAMPLE_BATCHES=1
-TIME_SAMPLING=uniform_t
-T_MAX=1.0
+EVAL_BATCH_SIZE=64
+NUM_SAMPLE_BATCHES=16
+CKPT_PATH="/share/kuleshov/yzs2/flm-og/outputs/lm1b/lm1b_full_flm_vdm_6/checkpoints/best_nll.ckpt"
+TIME_SAMPLING=warped_tau
+T_MAX=0.95
 
 python -u -m main \
       mode=sample_eval \

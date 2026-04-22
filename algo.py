@@ -1090,11 +1090,14 @@ class FLMVDM(FLM):
 
         self.cond_t = getattr(config.algo, 'cond_t', 'tau')
         self.time_sampling = getattr(config.algo, 'time_sampling', 'warped_tau')
+        self.warp_mix = float(getattr(config.algo, 'warp_mix', 0.0))
         self.gamma_min = getattr(config.algo, 'gamma_min', -5.)
         self.gamma_max = getattr(config.algo, 'gamma_max', 5.)
         self.train_loss = getattr(config.algo, 'train_loss', 'ce')
         self.train_on_weighted_loss = getattr(config.algo, 'train_on_weighted_loss', True)
         self.diagnostic_num_bins = getattr(config.algo, 'diagnostic_num_bins', 8)
+        if not 0.0 <= self.warp_mix <= 1.0:
+            raise ValueError(f"warp_mix must be in [0, 1], got {self.warp_mix}")
 
     def _conditioning_from_gamma(self, tau_t, t, gamma):
         if self.cond_t == 'tau':
@@ -1295,20 +1298,41 @@ class FLMVDM(FLM):
                                (0.5 * loss * loss_weight).mean().detach(),
                                group='objective')
         return loss, 0.5 * loss_weight
+
+    def _map_tau_to_physical_t(self, tau_t, tau_min=None, tau_max=None):
+        tau_min = self.t_min if tau_min is None else tau_min
+        tau_max = self.t_max if tau_max is None else tau_max
+
+        t_warp = self._tau_to_t(tau_t)
+        dt_dtau_warp = utils.d_alpha_to_gamma(tau_t, self.lut_a2g)
+        if self.warp_mix == 0.0:
+            return t_warp, dt_dtau_warp
+
+        tau_endpoints = tau_t.new_tensor([tau_min, tau_max])
+        t_endpoints = self._tau_to_t(tau_endpoints)
+        t_phys_min, t_phys_max = t_endpoints[0], t_endpoints[1]
+        tau_range = tau_t.new_tensor(tau_max - tau_min)
+        linear_slope = (t_phys_max - t_phys_min) / tau_range
+        t_linear = t_phys_min + linear_slope * (tau_t - tau_t.new_tensor(tau_min))
+        dt_dtau_linear = torch.full_like(dt_dtau_warp, linear_slope)
+
+        mix = tau_t.new_tensor(self.warp_mix)
+        t = torch.lerp(t_warp, t_linear, mix)
+        dt_dtau = torch.lerp(dt_dtau_warp, dt_dtau_linear, mix)
+        return t, dt_dtau
     
-    def _sample_training_times(self, B, accum_step):
+    def _sample_time_coordinates(self, B, accum_step):
         if self.time_sampling == "warped_tau":
             tau_t = self._sample_t_interval(B, accum_step,
                                             t_min=self.t_min, t_max=self.t_max)
-            t = self._tau_to_t(tau_t)
-            dt_dtau = utils.d_alpha_to_gamma(tau_t, self.lut_a2g)
+            t, dt_dtau = self._map_tau_to_physical_t(tau_t)
         elif self.time_sampling == "uniform_t":
-            tau_t = self._sample_t_interval(B, accum_step,
+            t = self._sample_t_interval(B, accum_step,
                                         t_min=self.t_min, t_max=self.t_max)
-            t = tau_t
+            tau_t = t
             dt_dtau = torch.ones_like(t)
         else:
-            raise ValueError(...)
+            raise ValueError(f"Unknown time_sampling: {self.time_sampling}")
         return tau_t, t, dt_dtau
 
     def loss(self, x0, output_tokens,
@@ -1317,7 +1341,7 @@ class FLMVDM(FLM):
         del given_t, not_sampling_t, output_tokens
         stage = 'train' if self.training else 'val'
         B = x0.shape[0]
-        tau_t, t, dt_dtau = self._sample_training_times(B, current_accumulation_step)
+        tau_t, t, dt_dtau = self._sample_time_coordinates(B, current_accumulation_step)
 
         x_t, cond_t, target_data, loss_weight, diagnostics = self.corrupt_continuous(
             x0, tau_t, t, dt_dtau, stage)
