@@ -12,7 +12,6 @@ NUM_SAMPLE_BATCHES="${NUM_SAMPLE_BATCHES:-1}"
 DISABLE_EMA="${DISABLE_EMA:-False}"
 DATA_DIR="${DATA_DIR:-/share/kuleshov/yzs2/data}"
 COND_T="${COND_T:-log_nsr}"
-TIME_SAMPLING="${TIME_SAMPLING:-uniform_t}"
 GAMMA_MIN="${GAMMA_MIN:--4.0}"
 GAMMA_MAX="${GAMMA_MAX:-5.0}"
 MODEL_LENGTH="${MODEL_LENGTH:-128}"
@@ -50,10 +49,6 @@ while [[ "$#" -gt 0 ]]; do
             ;;
         --cond_t)
             COND_T="$2"
-            shift 2
-            ;;
-        --time_sampling)
-            TIME_SAMPLING="$2"
             shift 2
             ;;
         --gamma_min)
@@ -106,7 +101,6 @@ echo "Eval batch size: ${EVAL_BATCH_SIZE}"
 echo "Num sample batches: ${NUM_SAMPLE_BATCHES}"
 echo "Disable EMA: ${DISABLE_EMA}"
 echo "cond_t: ${COND_T}"
-echo "time_sampling: ${TIME_SAMPLING}"
 echo "Output JSON: ${OUT_JSON}"
 
 python -u -m main \
@@ -125,7 +119,7 @@ python -u -m main \
     sampling.steps="${STEPS}" \
     sampling.predictor=ancestral \
     algo.double_temb=False \
-    algo.time_sampling="${TIME_SAMPLING}" \
+    algo.interpolant_type=vp_vdm \
     algo.t_max=1.0 \
     algo.cond_t="${COND_T}" \
     algo.gamma_min="${GAMMA_MIN}" \

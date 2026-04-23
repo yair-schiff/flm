@@ -1094,11 +1094,8 @@ class FLM(FLMBase):
 class FLMVDM(FLM):
     def __init__(self, config, tokenizer):
         super().__init__(config, tokenizer)
-        getattr(config.algo, 'interpolant_type', 'flm_linear')
-
+        self.interpolant_type = getattr(config.algo, 'interpolant_type', 'vp_vdm')
         self.cond_t = getattr(config.algo, 'cond_t', 'tau')
-        self.time_sampling = getattr(config.algo, 'time_sampling', 'warped_tau')
-        self.warp_mix = float(getattr(config.algo, 'warp_mix', 0.0))
         self.gamma_min = getattr(config.algo, 'gamma_min', -5.)
         self.gamma_max = getattr(config.algo, 'gamma_max', 5.)
         self.train_loss = getattr(config.algo, 'train_loss', 'ce')
@@ -1109,8 +1106,10 @@ class FLMVDM(FLM):
             getattr(self.self_conditioning_cfg, 'enabled', False))
         self.self_conditioning_train_prob = float(
             getattr(self.self_conditioning_cfg, 'train_prob', 0.25))
-        if not 0.0 <= self.warp_mix <= 1.0:
-            raise ValueError(f"warp_mix must be in [0, 1], got {self.warp_mix}")
+        if self.interpolant_type != 'vp_vdm':
+            raise NotImplementedError(
+                "FLMVDM currently supports only interpolant_type='vp_vdm', "
+                f"got {self.interpolant_type}")
         if not 0.0 <= self.self_conditioning_train_prob <= 1.0:
             raise ValueError(
                 "self_conditioning.train_prob must be in [0, 1], "
@@ -1120,12 +1119,24 @@ class FLMVDM(FLM):
             raise NotImplementedError(
                 "FLM-VDM self-conditioning is only implemented for the DiT "
                 f"backbone, got {self.config.algo.backbone}")
+        self.lut_tau2gamma, self.lut_gamma2tau = utils.build_vp_luts(
+            K=self.vocab_size,
+            gamma_min=self.gamma_min,
+            gamma_max=self.gamma_max,
+        )
 
-    def _get_noise_conditioning(self, tau_t, t, gamma):
+    def _tau_to_gamma(self, tau):
+        return utils.tau_to_gamma(tau, self.lut_tau2gamma)
+
+    def _gamma_to_tau(self, gamma):
+        return utils.gamma_to_tau(gamma, self.lut_gamma2tau)
+
+    def _d_gamma_by_d_tau(self, tau):
+        return utils.d_tau_to_gamma(tau, self.lut_tau2gamma)
+
+    def _get_noise_conditioning(self, tau_t, gamma):
         if self.cond_t == 'tau':
             return tau_t
-        if self.cond_t == 't':
-            return t
         if self.cond_t == 'snr':
             return torch.exp(-gamma)
         if self.cond_t == 'log_snr':
@@ -1167,13 +1178,14 @@ class FLMVDM(FLM):
         self._log_stage_metric(stage, f'{name}_max', values.max(),
                                group=group)
 
-    def _log_weight_diagnostics(self, stage, t, gamma, snr_prime_t,
-                                dt_dtau, loss_weight):
-        self._log_distribution_stats(stage, 't', t, group='stats')
+    def _log_weight_diagnostics(self, stage, tau, gamma, snr_prime_tau,
+                                dgamma_dtau, loss_weight):
+        self._log_distribution_stats(stage, 'tau', tau, group='stats')
         self._log_distribution_stats(stage, 'gamma', gamma, group='stats')
-        self._log_distribution_stats(stage, 'snr_prime_t', snr_prime_t,
+        self._log_distribution_stats(stage, 'snr_prime_tau', snr_prime_tau,
                                      group='stats')
-        self._log_distribution_stats(stage, 'dt_dtau', dt_dtau, group='stats')
+        self._log_distribution_stats(stage, 'dgamma_dtau', dgamma_dtau,
+                                     group='stats')
         self._log_distribution_stats(stage, 'loss_weight', loss_weight,
                                      group='stats')
 
@@ -1184,7 +1196,7 @@ class FLMVDM(FLM):
                                ess / max(loss_weight.numel(), 1),
                                group='stats')
 
-    def _log_objective_diagnostics(self, stage, t, target_data,
+    def _log_objective_diagnostics(self, stage, tau, target_data,
                                    log_softmax_pred, loss_weight):
         probs = log_softmax_pred.exp()
         ce_loss = -(target_data * log_softmax_pred).sum(dim=-1)
@@ -1226,62 +1238,61 @@ class FLMVDM(FLM):
         weighted_ce_per_sample = ce_per_sample * loss_weight.squeeze(-1)
         token_accuracy_per_sample = token_accuracy.mean(dim=-1)
         num_bins = max(int(self.diagnostic_num_bins), 1)
-        edges = torch.linspace(0.0, 1.0, num_bins + 1, device=t.device)
-        bin_ids = torch.bucketize(t.detach(), edges[1:-1])
+        edges = torch.linspace(0.0, 1.0, num_bins + 1, device=tau.device)
+        bin_ids = torch.bucketize(tau.detach(), edges[1:-1])
 
-        zero = t.new_tensor(0.0)
+        zero = tau.new_tensor(0.0)
         for bin_idx in range(num_bins):
             mask = bin_ids == bin_idx
             if mask.any():
                 self._log_stage_metric(
-                    stage, f't_bin_{bin_idx}_frac',
+                    stage, f'tau_bin_{bin_idx}_frac',
                     mask.float().mean(),
                     group='objective')
                 self._log_stage_metric(
-                    stage, f't_bin_{bin_idx}_mean',
-                    t[mask].mean(),
+                    stage, f'tau_bin_{bin_idx}_mean',
+                    tau[mask].mean(),
                     group='objective')
                 self._log_stage_metric(
-                    stage, f't_bin_{bin_idx}_ce',
+                    stage, f'tau_bin_{bin_idx}_ce',
                     ce_per_sample[mask].mean(),
                     group='objective')
                 self._log_stage_metric(
-                    stage, f't_bin_{bin_idx}_weight',
+                    stage, f'tau_bin_{bin_idx}_weight',
                     loss_weight.squeeze(-1)[mask].mean(),
                     group='objective')
                 self._log_stage_metric(
-                    stage, f't_bin_{bin_idx}_weighted_ce',
+                    stage, f'tau_bin_{bin_idx}_weighted_ce',
                     weighted_ce_per_sample[mask].mean(),
                     group='objective')
                 self._log_stage_metric(
-                    stage, f't_bin_{bin_idx}_accuracy',
+                    stage, f'tau_bin_{bin_idx}_accuracy',
                     token_accuracy_per_sample[mask].mean(),
                     group='objective')
             else:
-                self._log_stage_metric(stage, f't_bin_{bin_idx}_frac', zero,
+                self._log_stage_metric(stage, f'tau_bin_{bin_idx}_frac', zero,
                                        group='objective')
-                self._log_stage_metric(stage, f't_bin_{bin_idx}_mean', zero,
+                self._log_stage_metric(stage, f'tau_bin_{bin_idx}_mean', zero,
                                        group='objective')
-                self._log_stage_metric(stage, f't_bin_{bin_idx}_ce', zero,
+                self._log_stage_metric(stage, f'tau_bin_{bin_idx}_ce', zero,
                                        group='objective')
-                self._log_stage_metric(stage, f't_bin_{bin_idx}_weight', zero,
+                self._log_stage_metric(stage, f'tau_bin_{bin_idx}_weight', zero,
                                        group='objective')
                 self._log_stage_metric(
-                    stage, f't_bin_{bin_idx}_weighted_ce', zero,
+                    stage, f'tau_bin_{bin_idx}_weighted_ce', zero,
                     group='objective')
-                self._log_stage_metric(stage, f't_bin_{bin_idx}_accuracy', zero,
+                self._log_stage_metric(stage, f'tau_bin_{bin_idx}_accuracy', zero,
                                        group='objective')
     
-    def corrupt_continuous(self, x0, tau_t, t, dt_dtau, stage):
+    def corrupt_continuous(self, x0, tau_t, gamma, dgamma_dtau, stage):
         target_data = F.one_hot(x0, self.vocab_size).float()
         noise = torch.randn_like(target_data, dtype=torch.float32)
 
-        gamma = self.gamma_max + (self.gamma_min - self.gamma_max) * t
-        # Under the VP parameterization below, SNR(t) = exp(-gamma(t)).
-        # Since gamma(t) is linear in FLM time, SNR'(t) is exp(-gamma(t))
-        # times the constant slope (gamma_max - gamma_min).
-        snr_prime_t = torch.exp(-gamma) * (self.gamma_max - self.gamma_min)
-        loss_weight = snr_prime_t * dt_dtau
+        # Under VP parameterization, SNR(gamma) = exp(-gamma). Since tau is
+        # the primary sampled time coordinate, the Jacobian-aware weight is the
+        # positive derivative dSNR / dtau = -exp(-gamma) * dgamma / dtau.
+        snr_prime_tau = torch.exp(-gamma) * (-dgamma_dtau)
+        loss_weight = snr_prime_tau
 
         alpha = torch.sigmoid(-gamma).sqrt().unsqueeze(-1).unsqueeze(-1)
         sigma = torch.sigmoid(gamma).sqrt().unsqueeze(-1).unsqueeze(-1)
@@ -1292,13 +1303,13 @@ class FLMVDM(FLM):
 
         x_t = alpha * target_data + sigma * noise
         diagnostics = {
-            't': t,
+            'tau': tau_t,
             'gamma': gamma,
-            'snr_prime_t': snr_prime_t,
-            'dt_dtau': dt_dtau,
+            'snr_prime_tau': snr_prime_tau,
+            'dgamma_dtau': dgamma_dtau,
             'loss_weight': loss_weight,
         }
-        cond_t = self._get_noise_conditioning(tau_t, t, gamma)
+        cond_t = self._get_noise_conditioning(tau_t, gamma)
         return x_t, cond_t, target_data, loss_weight.unsqueeze(-1), diagnostics
     
     def _ce_loss(self, target_data, log_softmax_pred, loss_weight, stage):
@@ -1321,41 +1332,16 @@ class FLMVDM(FLM):
                                group='objective')
         return loss, 0.5 * loss_weight
 
-    def _map_tau_to_physical_t(self, tau_t, tau_min=None, tau_max=None):
-        tau_min = self.t_min if tau_min is None else tau_min
-        tau_max = self.t_max if tau_max is None else tau_max
-
-        t_warp = self._tau_to_t(tau_t)
-        dt_dtau_warp = utils.d_alpha_to_gamma(tau_t, self.lut_a2g)
-        if self.warp_mix == 0.0:
-            return t_warp, dt_dtau_warp
-
-        tau_endpoints = tau_t.new_tensor([tau_min, tau_max])
-        t_endpoints = self._tau_to_t(tau_endpoints)
-        t_phys_min, t_phys_max = t_endpoints[0], t_endpoints[1]
-        tau_range = tau_t.new_tensor(tau_max - tau_min)
-        linear_slope = (t_phys_max - t_phys_min) / tau_range
-        t_linear = t_phys_min + linear_slope * (tau_t - tau_t.new_tensor(tau_min))
-        dt_dtau_linear = torch.full_like(dt_dtau_warp, linear_slope)
-
-        mix = tau_t.new_tensor(self.warp_mix)
-        t = torch.lerp(t_warp, t_linear, mix)
-        dt_dtau = torch.lerp(dt_dtau_warp, dt_dtau_linear, mix)
-        return t, dt_dtau
-    
-    def _sample_time_coordinates(self, B, accum_step):
-        if self.time_sampling == "warped_tau":
-            tau_t = self._sample_t_interval(B, accum_step,
-                                            t_min=self.t_min, t_max=self.t_max)
-            t, dt_dtau = self._map_tau_to_physical_t(tau_t)
-        elif self.time_sampling == "uniform_t":
-            t = self._sample_t_interval(B, accum_step,
-                                        t_min=self.t_min, t_max=self.t_max)
-            tau_t = t
-            dt_dtau = torch.ones_like(t)
-        else:
-            raise ValueError(f"Unknown time_sampling: {self.time_sampling}")
-        return tau_t, t, dt_dtau
+    def _sample_tau_coordinates(self, B, accum_step):
+        tau_t = self._sample_t_interval(
+            B,
+            accum_step,
+            t_min=self.t_min,
+            t_max=self.t_max,
+        )
+        gamma = self._tau_to_gamma(tau_t)
+        dgamma_dtau = self._d_gamma_by_d_tau(tau_t)
+        return tau_t, gamma, dgamma_dtau
 
     def _build_self_conditioning(self, x_t, cond_t, self_cond_mask=None):
         if not self.self_conditioning_enabled:
@@ -1382,10 +1368,11 @@ class FLMVDM(FLM):
         del given_t, not_sampling_t, output_tokens
         stage = 'train' if self.training else 'val'
         B = x0.shape[0]
-        tau_t, t, dt_dtau = self._sample_time_coordinates(B, current_accumulation_step)
+        tau_t, gamma, dgamma_dtau = self._sample_tau_coordinates(
+            B, current_accumulation_step)
 
         x_t, cond_t, target_data, loss_weight, diagnostics = self.corrupt_continuous(
-            x0, tau_t, t, dt_dtau, stage)
+            x0, tau_t, gamma, dgamma_dtau, stage)
         self_cond = None
         if self.self_conditioning_enabled:
             if self.training:
@@ -1411,7 +1398,7 @@ class FLMVDM(FLM):
 
         f = self.forward(x_t, cond_t, self_cond=self_cond)
         self._log_weight_diagnostics(stage, **diagnostics)
-        self._log_objective_diagnostics(stage, diagnostics['t'],
+        self._log_objective_diagnostics(stage, diagnostics['tau'],
                                         target_data, f, loss_weight)
         if self.train_loss == 'ce':
             with torch.no_grad():
@@ -1444,20 +1431,11 @@ class FLMVDM(FLM):
         device = self.device
         sigma_floor = 1e-5
 
-        time_vals = torch.linspace(
+        tau_vals = torch.linspace(
             self.t_min, self.t_max, num_steps + 1, device=device)
-        if self.time_sampling == "warped_tau":
-            tau_vals = time_vals
-            t_vals = self._tau_to_t(tau_vals)
-        elif self.time_sampling == "uniform_t":
-            t_vals = time_vals
-            tau_vals = time_vals
-        else:
-            raise ValueError(f"Unknown time_sampling: {self.time_sampling}")
+        gamma_vals = self._tau_to_gamma(tau_vals)
 
-        gamma_start = (
-            self.gamma_max + (self.gamma_min - self.gamma_max) * t_vals[0]
-        )
+        gamma_start = gamma_vals[0]
         sigma_start = torch.sigmoid(gamma_start).sqrt()
         z = sigma_start * torch.randn(
             (num_samples, L, V), device=device, dtype=self.dtype)
@@ -1466,13 +1444,10 @@ class FLMVDM(FLM):
         for i in range(num_steps):
             tau_curr = tau_vals[i].expand(B)
             tau_next = tau_vals[i + 1].expand(B)
-            t_curr = t_vals[i].expand(B)
-            t_next = t_vals[i + 1].expand(B)
-
-            gamma_curr = self.gamma_max + (self.gamma_min - self.gamma_max) * t_curr
+            gamma_curr = gamma_vals[i].expand(B)
             alpha_curr = torch.sigmoid(-gamma_curr).sqrt().view(-1, 1, 1)
             sigma_curr = torch.sigmoid(gamma_curr).sqrt().view(-1, 1, 1)
-            cond_curr = self._get_noise_conditioning(tau_curr, t_curr, gamma_curr)
+            cond_curr = self._get_noise_conditioning(tau_curr, gamma_curr)
 
             x_hat0 = self.forward(
                 z, cond_curr, self_cond=self_cond_probs).exp()
@@ -1482,15 +1457,14 @@ class FLMVDM(FLM):
                 z - alpha_curr * x_hat0
             ) / sigma_curr.clamp_min(sigma_floor)
 
-            gamma_next = self.gamma_max + (self.gamma_min - self.gamma_max) * t_next
+            gamma_next = gamma_vals[i + 1].expand(B)
             alpha_next = torch.sigmoid(-gamma_next).sqrt().view(-1, 1, 1)
             sigma_next = torch.sigmoid(gamma_next).sqrt().view(-1, 1, 1)
             z = alpha_next * x_hat0 + sigma_next * eps_hat
 
         tau_end = tau_vals[-1].expand(B)
-        t_end = t_vals[-1].expand(B)
-        gamma_end = self.gamma_max + (self.gamma_min - self.gamma_max) * t_end
-        cond_end = self._get_noise_conditioning(tau_end, t_end, gamma_end)
+        gamma_end = gamma_vals[-1].expand(B)
+        cond_end = self._get_noise_conditioning(tau_end, gamma_end)
         return self.forward(
             z, cond_end, self_cond=self_cond_probs).argmax(dim=-1)
 
