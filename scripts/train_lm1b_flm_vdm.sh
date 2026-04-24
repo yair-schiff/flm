@@ -5,7 +5,7 @@
 #SBATCH --get-user-env                # retrieve the users login environment
 #SBATCH --mem=100000                  # server memory requested (per node)
 #SBATCH -t 960:00:00                  # Time limit (hh:mm:ss)
-#SBATCH --partition=kuleshov,gpu               # Request partition
+#SBATCH --partition=kuleshov               # Request partition
 #SBATCH --constraint="[h200|h100|a100|a6000|a5000]"
 #SBATCH --ntasks-per-node=8
 #SBATCH --gres=gpu:8                  # Type/number of GPUs needed
@@ -38,6 +38,11 @@ VAL_TAU_MIN="${VAL_TAU_MIN:-$TAU_MIN}"
 VAL_TAU_MAX="${VAL_TAU_MAX:-$TAU_MAX}"
 GAMMA_MIN="${GAMMA_MIN:--3.0}"
 GAMMA_MAX="${GAMMA_MAX:-5.0}"
+NOISE_PROPOSAL="${NOISE_PROPOSAL:-tau}"
+TRAIN_OBJECTIVE="${TRAIN_OBJECTIVE:-vlb}"
+GAMMA_PROPOSAL_LOC="${GAMMA_PROPOSAL_LOC:-0.0}"
+GAMMA_PROPOSAL_SCALE="${GAMMA_PROPOSAL_SCALE:-1.0}"
+VLB_PROPOSAL_FLOOR="${VLB_PROPOSAL_FLOOR:-0.05}"
 TRAIN_LOSS="${TRAIN_LOSS:-ce}"
 TRAIN_ON_WEIGHTED_LOSS="${TRAIN_ON_WEIGHTED_LOSS:-True}"
 DOUBLE_TEMB="${DOUBLE_TEMB:-False}"
@@ -96,6 +101,11 @@ torchrun --nnodes=$NUM_NODES --nproc_per_node=$NPROC --master_port=$MASTER_PORT 
   algo.cond_t=${COND_T} \
   algo.gamma_min=${GAMMA_MIN} \
   algo.gamma_max=${GAMMA_MAX} \
+  algo.noise_proposal=${NOISE_PROPOSAL} \
+  algo.train_objective=${TRAIN_OBJECTIVE} \
+  algo.gamma_proposal_loc=${GAMMA_PROPOSAL_LOC} \
+  algo.gamma_proposal_scale=${GAMMA_PROPOSAL_SCALE} \
+  algo.vlb_proposal_floor=${VLB_PROPOSAL_FLOOR} \
   algo.train_loss=${TRAIN_LOSS} \
   algo.train_on_weighted_loss=${TRAIN_ON_WEIGHTED_LOSS} \
   algo.self_conditioning.enabled=${SELF_CONDITIONING_ENABLED} \
