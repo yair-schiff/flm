@@ -11,6 +11,8 @@ ignore_bos: False
 interpolant_type: vp_vdm
 t_max: 1.0
 t_min: 0.0
+val_t_min: ${.t_min}
+val_t_max: ${.t_max}
 double_temb: False
 learnable_loss_weighting: False
 cond_t: tau  # tau, snr, log_snr, nsr, log_nsr

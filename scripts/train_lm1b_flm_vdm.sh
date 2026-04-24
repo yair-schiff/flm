@@ -34,6 +34,8 @@ INTERPOLANT_TYPE="${INTERPOLANT_TYPE:-vp_vdm}"
 COND_T="${COND_T:-log_nsr}"
 TAU_MIN="${TAU_MIN:-0.0}"
 TAU_MAX="${TAU_MAX:-0.9999}"
+VAL_TAU_MIN="${VAL_TAU_MIN:-$TAU_MIN}"
+VAL_TAU_MAX="${VAL_TAU_MAX:-$TAU_MAX}"
 GAMMA_MIN="${GAMMA_MIN:--3.0}"
 GAMMA_MAX="${GAMMA_MAX:-5.0}"
 TRAIN_LOSS="${TRAIN_LOSS:-ce}"
@@ -89,6 +91,8 @@ torchrun --nnodes=$NUM_NODES --nproc_per_node=$NPROC --master_port=$MASTER_PORT 
   algo.interpolant_type=${INTERPOLANT_TYPE} \
   algo.t_min=${TAU_MIN} \
   algo.t_max=${TAU_MAX} \
+  algo.val_t_min=${VAL_TAU_MIN} \
+  algo.val_t_max=${VAL_TAU_MAX} \
   algo.cond_t=${COND_T} \
   algo.gamma_min=${GAMMA_MIN} \
   algo.gamma_max=${GAMMA_MAX} \

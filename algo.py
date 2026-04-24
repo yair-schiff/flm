@@ -1094,6 +1094,10 @@ class FLM(FLMBase):
 class FLMVDM(FLM):
     def __init__(self, config, tokenizer):
         super().__init__(config, tokenizer)
+        self.train_t_min = self.t_min
+        self.train_t_max = self.t_max
+        self.val_t_min = getattr(config.algo, 'val_t_min', self.train_t_min)
+        self.val_t_max = getattr(config.algo, 'val_t_max', self.train_t_max)
         self.interpolant_type = getattr(config.algo, 'interpolant_type', 'vp_vdm')
         self.cond_t = getattr(config.algo, 'cond_t', 'tau')
         self.gamma_min = getattr(config.algo, 'gamma_min', -5.)
@@ -1333,11 +1337,12 @@ class FLMVDM(FLM):
         return loss, 0.5 * loss_weight
 
     def _sample_tau_coordinates(self, B, accum_step):
+        t_min, t_max = (self.train_t_min, self.train_t_max) if self.training else (self.val_t_min, self.val_t_max)
         tau_t = self._sample_t_interval(
             B,
             accum_step,
-            t_min=self.t_min,
-            t_max=self.t_max,
+            t_min=t_min,
+            t_max=t_max,
         )
         gamma = self._tau_to_gamma(tau_t)
         dgamma_dtau = self._d_gamma_by_d_tau(tau_t)
@@ -1431,8 +1436,9 @@ class FLMVDM(FLM):
         device = self.device
         sigma_floor = 1e-5
 
+        t_min, t_max = self.val_t_min, self.val_t_max
         tau_vals = torch.linspace(
-            self.t_min, self.t_max, num_steps + 1, device=device)
+            t_min, t_max, num_steps + 1, device=device)
         gamma_vals = self._tau_to_gamma(tau_vals)
 
         gamma_start = gamma_vals[0]
