@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Interactive explorer for FLM and VP-native FLMVDM time warps.
 
+This is the main combined explorer for schedule, warp, and tau/error views.
+
 Run from the repo root with:
 
     streamlit run scripts/flm_vdm_schedule_explorer.py
@@ -19,6 +21,17 @@ from omegaconf import OmegaConf
 from plotly.subplots import make_subplots
 from scipy.interpolate import CubicSpline
 from scipy.special import expit, log_ndtr
+from scripts.flm_vdm_tau_error_explorer import (
+    CompareParams,
+    NOTES_PATH,
+    build_derivative_figure as build_tau_error_derivative_figure,
+    build_error_figure as build_tau_error_error_figure,
+    build_sampling_comparison_figure as build_tau_error_sampling_figure,
+    build_tau_figure as build_tau_error_tau_figure,
+    compute_comparison as compute_tau_error_comparison,
+    enrich_comparison as enrich_tau_error_comparison,
+    load_notes_markdown,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CONFIG_PATH = REPO_ROOT / "configs" / "algo" / "flm_vdm.yaml"
@@ -270,14 +283,27 @@ def sample_spacing(params: ScheduleParams, num_steps: int) -> dict[str, np.ndarr
         "step_idx": np.arange(num_steps),
         "tau_steps": tau_steps,
         "coord_steps": np.asarray(schedule["coord"]),
+        "derivative_steps": np.asarray(schedule["derivative"]),
+        "gamma_steps": np.asarray(schedule["gamma"]),
+        "log_snr_steps": np.asarray(schedule["log_snr"]),
+        "snr_steps": np.asarray(schedule["snr"]),
+        "nsr_steps": np.asarray(schedule["nsr"]),
         "alpha_steps": np.asarray(schedule["alpha"]),
         "sigma_steps": np.asarray(schedule["sigma"]),
+        "weight_factor_steps": np.asarray(schedule["weight_factor"]),
+        "loss_weight_steps": np.asarray(schedule["loss_weight"]),
+        "weight_compare_steps": np.asarray(schedule["weight_compare"]),
     }
 
 
 def build_warp_figure(schedule: dict[str, np.ndarray | float | str], spacing: dict[str, np.ndarray]) -> go.Figure:
     tau = np.asarray(schedule["tau"])
     coord = np.asarray(schedule["coord"])
+    marker_style = {
+        "mode": "markers",
+        "marker": {"size": 7, "symbol": "diamond"},
+        "showlegend": False,
+    }
 
     fig = make_subplots(
         rows=2,
@@ -298,6 +324,9 @@ def build_warp_figure(schedule: dict[str, np.ndarray | float | str], spacing: di
     fig.add_trace(go.Scatter(x=spacing["step_idx"], y=spacing["coord_steps"], mode="lines+markers", name=schedule["coord_name"]), row=2, col=2)
     fig.add_trace(go.Scatter(x=spacing["step_idx"], y=spacing["alpha_steps"], mode="lines+markers", name="alpha", line={"dash": "dash"}), row=2, col=2)
     fig.add_trace(go.Scatter(x=spacing["step_idx"], y=spacing["sigma_steps"], mode="lines+markers", name="sigma", line={"dash": "dot"}), row=2, col=2)
+    fig.add_trace(go.Scatter(x=spacing["tau_steps"], y=spacing["coord_steps"], **marker_style), row=1, col=1)
+    fig.add_trace(go.Scatter(x=spacing["coord_steps"], y=spacing["tau_steps"], **marker_style), row=1, col=2)
+    fig.add_trace(go.Scatter(x=spacing["tau_steps"], y=spacing["derivative_steps"], **marker_style), row=2, col=1)
 
     fig.update_xaxes(title_text="tau", row=1, col=1)
     fig.update_yaxes(title_text=str(schedule["coord_name"]), row=1, col=1)
@@ -311,7 +340,16 @@ def build_warp_figure(schedule: dict[str, np.ndarray | float | str], spacing: di
     return fig
 
 
-def build_noise_figure(schedule: dict[str, np.ndarray | float | str], log_scale: bool) -> go.Figure:
+def build_noise_figure(
+    schedule: dict[str, np.ndarray | float | str],
+    spacing: dict[str, np.ndarray],
+    log_scale: bool,
+) -> go.Figure:
+    marker_style = {
+        "mode": "markers",
+        "marker": {"size": 7, "symbol": "diamond"},
+        "showlegend": False,
+    }
     fig = make_subplots(
         rows=2,
         cols=2,
@@ -333,6 +371,14 @@ def build_noise_figure(schedule: dict[str, np.ndarray | float | str], log_scale:
     fig.add_trace(go.Scatter(x=schedule["tau"], y=schedule["sigma"], name="sigma(tau)", line={"dash": "dash"}), row=2, col=1)
     fig.add_trace(go.Scatter(x=schedule["tau"], y=schedule["weight_factor"], name=str(schedule["weight_factor_name"])), row=2, col=2)
     fig.add_trace(go.Scatter(x=schedule["tau"], y=schedule["loss_weight"], name="loss weight", line={"width": 4}), row=2, col=2)
+    fig.add_trace(go.Scatter(x=spacing["tau_steps"], y=spacing["gamma_steps"], **marker_style), row=1, col=1)
+    fig.add_trace(go.Scatter(x=spacing["tau_steps"], y=spacing["log_snr_steps"], **marker_style), row=1, col=1)
+    fig.add_trace(go.Scatter(x=spacing["tau_steps"], y=spacing["snr_steps"], **marker_style), row=1, col=2)
+    fig.add_trace(go.Scatter(x=spacing["tau_steps"], y=spacing["nsr_steps"], **marker_style), row=1, col=2)
+    fig.add_trace(go.Scatter(x=spacing["tau_steps"], y=spacing["alpha_steps"], **marker_style), row=2, col=1)
+    fig.add_trace(go.Scatter(x=spacing["tau_steps"], y=spacing["sigma_steps"], **marker_style), row=2, col=1)
+    fig.add_trace(go.Scatter(x=spacing["tau_steps"], y=spacing["weight_factor_steps"], **marker_style), row=2, col=2)
+    fig.add_trace(go.Scatter(x=spacing["tau_steps"], y=spacing["loss_weight_steps"], **marker_style), row=2, col=2)
 
     fig.update_xaxes(title_text="tau", row=1, col=1)
     fig.update_yaxes(title_text="value", row=1, col=1)
@@ -346,7 +392,11 @@ def build_noise_figure(schedule: dict[str, np.ndarray | float | str], log_scale:
     return fig
 
 
-def build_weight_compare_figure(schedule: dict[str, np.ndarray | float | str], log_scale: bool) -> go.Figure:
+def build_weight_compare_figure(
+    schedule: dict[str, np.ndarray | float | str],
+    spacing: dict[str, np.ndarray],
+    log_scale: bool,
+) -> go.Figure:
     fig = make_subplots(
         rows=1,
         cols=2,
@@ -362,6 +412,50 @@ def build_weight_compare_figure(schedule: dict[str, np.ndarray | float | str], l
     for name, y, line in trace_specs:
         fig.add_trace(go.Scatter(x=schedule["tau"], y=y, name=name, line=line), row=1, col=1)
         fig.add_trace(go.Scatter(x=schedule["tau"], y=y, name=name, line=line, showlegend=False), row=1, col=2)
+    fig.add_trace(
+        go.Scatter(
+            x=spacing["tau_steps"],
+            y=spacing["weight_factor_steps"],
+            mode="markers",
+            marker={"size": 7, "symbol": "diamond"},
+            showlegend=False,
+        ),
+        row=1,
+        col=1,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=spacing["tau_steps"],
+            y=spacing["weight_compare_steps"],
+            mode="markers",
+            marker={"size": 7, "symbol": "diamond"},
+            showlegend=False,
+        ),
+        row=1,
+        col=1,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=spacing["tau_steps"],
+            y=spacing["weight_factor_steps"],
+            mode="markers",
+            marker={"size": 7, "symbol": "diamond"},
+            showlegend=False,
+        ),
+        row=1,
+        col=2,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=spacing["tau_steps"],
+            y=spacing["weight_compare_steps"],
+            mode="markers",
+            marker={"size": 7, "symbol": "diamond"},
+            showlegend=False,
+        ),
+        row=1,
+        col=2,
+    )
 
     fig.update_xaxes(title_text="tau", row=1, col=1)
     fig.update_yaxes(title_text="value", row=1, col=1)
@@ -422,7 +516,8 @@ def main() -> None:
     st.title("FLM VDM Schedule Explorer")
     st.caption(
         "Explore the legacy FLM tau<->t warp and the VP-native FLMVDM tau<->gamma warp "
-        "with the same decoding-progress definition from Equation 25."
+        "with the same decoding-progress definition from Equation 25. This combined app now "
+        "also includes the former standalone tau/error comparison views."
     )
 
     with st.sidebar:
@@ -491,6 +586,18 @@ def main() -> None:
         with st.expander("Advanced"):
             lut_points = st.slider("LUT resolution", min_value=1000, max_value=10000, value=10000, step=500)
             plot_points = st.slider("Plot resolution", min_value=256, max_value=4096, value=2048, step=256)
+            tau_error_n_gh = st.slider(
+                "Tau/error Gauss-Hermite nodes", min_value=20, max_value=200, value=100, step=10
+            )
+            flm_plot_t_max = st.number_input(
+                "FLM t_max for tau/error plots",
+                min_value=0.0,
+                max_value=0.999999,
+                value=min(float(defaults["t_max"]), 0.999999),
+                step=1e-4,
+                format="%.6f",
+                help="Use values like 0.999 or 0.9999 to inspect the FLM clean-end tail in the shared tau/error views.",
+            )
             compare_vocab_sizes = st.multiselect(
                 "Vocab sizes to compare",
                 options=[256, 1024, 8192, 30522, 50258, 100000, int(vocab_size)],
@@ -502,6 +609,9 @@ def main() -> None:
         st.stop()
     if gamma_min >= gamma_max:
         st.error("`gamma_min` must be strictly smaller than `gamma_max`.")
+        st.stop()
+    if not (0.0 <= flm_plot_t_max < 1.0):
+        st.error("`FLM t_max for tau/error plots` must satisfy 0 <= t_max < 1.")
         st.stop()
 
     params = ScheduleParams(
@@ -516,6 +626,19 @@ def main() -> None:
     )
     schedule = compute_schedule(params)
     spacing = sample_spacing(params, num_steps=num_steps)
+    compare_params = CompareParams(
+        vocab_size=int(vocab_size),
+        gamma_min=float(gamma_min),
+        gamma_max=float(gamma_max),
+        t_plot_max=float(flm_plot_t_max),
+        plot_points=int(plot_points),
+        n_gh=int(tau_error_n_gh),
+        tau_sample_points=int(num_steps),
+        cache_version=2,
+    )
+    compare_data = enrich_tau_error_comparison(
+        compute_tau_error_comparison(compare_params), compare_params
+    )
 
     col1, col2, col3, col4 = st.columns(4)
     if params.interpolant_type == "vp_vdm":
@@ -537,20 +660,35 @@ def main() -> None:
             "Gaussian interpolation, and the explorer maps tau back to physical t."
         )
 
-    warp_tab, noise_tab, vocab_tab, export_tab = st.tabs(
-        ["Warp and Spacing", "Noise and Weight", "Vocab Comparison", "Config Snippet"]
+    warp_tab, noise_tab, compare_tab, notes_tab, vocab_tab, export_tab = st.tabs(
+        [
+            "Warp and Spacing",
+            "Noise and Weight",
+            "Tau/Error Comparison",
+            "Notes",
+            "Vocab Comparison",
+            "Config Snippet",
+        ]
     )
 
     with warp_tab:
         st.plotly_chart(build_warp_figure(schedule, spacing), use_container_width=True)
         st.caption(
             "The selected interpolant determines which inverse LUT is visualized: tau<->t for legacy FLM "
-            "and tau<->gamma for VP-native FLMVDM."
+            "and tau<->gamma for VP-native FLMVDM. Diamond markers show the finite set of uniformly "
+            "spaced tau samples mapped through the same runtime warp."
         )
 
     with noise_tab:
-        st.plotly_chart(build_noise_figure(schedule, log_scale=log_scale), use_container_width=True)
-        st.plotly_chart(build_weight_compare_figure(schedule, log_scale=log_scale), use_container_width=True)
+        st.plotly_chart(build_noise_figure(schedule, spacing, log_scale=log_scale), use_container_width=True)
+        st.plotly_chart(
+            build_weight_compare_figure(schedule, spacing, log_scale=log_scale),
+            use_container_width=True,
+        )
+        st.caption(
+            "The same uniform tau sample overlay is shown on the noise, coefficient, and weighting "
+            "curves so you can see exactly where a finite-step schedule lands in each coordinate system."
+        )
         stats_col1, stats_col2 = st.columns(2)
         stats_col1.write(
             {
@@ -568,6 +706,21 @@ def main() -> None:
                 "loss_weight_max": float(np.max(schedule["loss_weight"])),
             }
         )
+
+    with compare_tab:
+        st.plotly_chart(build_tau_error_tau_figure(compare_data), use_container_width=True)
+        st.caption(
+            "This is the former tau/error explorer folded into the schedule explorer. It compares "
+            "FLM tau(t) against the VP/VDM tau(SNR) and tau(gamma) views using the same vocabulary "
+            "size and endpoint controls."
+        )
+        st.plotly_chart(build_tau_error_derivative_figure(compare_data), use_container_width=True)
+        st.plotly_chart(build_tau_error_sampling_figure(compare_data), use_container_width=True)
+        st.plotly_chart(build_tau_error_error_figure(compare_data), use_container_width=True)
+
+    with notes_tab:
+        st.caption(f"Rendered from `{NOTES_PATH.relative_to(REPO_ROOT)}`.")
+        st.markdown(load_notes_markdown())
 
     with vocab_tab:
         compare_vocab_sizes = sorted(set(int(v) for v in compare_vocab_sizes + [int(vocab_size)]))

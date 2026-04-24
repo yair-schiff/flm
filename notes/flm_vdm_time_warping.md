@@ -413,7 +413,8 @@ So:
 - in legacy FLM, the repo visualizes \(P_e(t)\)
 - in VP/VDM, the natural analogue is \(P_e(\gamma)\) or \(P_e(\mathrm{SNR})\)
 
-The comparison explorer `scripts/flm_vdm_tau_error_explorer.py` plots:
+The main combined explorer `scripts/flm_vdm_schedule_explorer.py` now includes a
+dedicated tau/error comparison tab. Those views plot:
 
 - \(\tau(t)\) and \(t(\tau)\) for legacy FLM
 - \(\tau(\mathrm{SNR})\), \(\mathrm{SNR}(\tau)\), \(\tau(\gamma)\), and \(\gamma(\tau)\) for VP
@@ -470,5 +471,8 @@ That is the main conceptual shift introduced by the refactor.
   - `corrupt_continuous`
   - `generate_samples`
 
+- `scripts/flm_vdm_schedule_explorer.py`
+  - main combined Streamlit explorer for schedule, warp, and tau/error views
+
 - `scripts/flm_vdm_tau_error_explorer.py`
-  - visual comparison of the legacy FLM and VP-native curves
+  - focused companion app for just the tau/error comparison views
