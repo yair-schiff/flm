@@ -18,6 +18,11 @@ learnable_loss_weighting: False
 cond_t: tau  # tau, snr, log_snr, nsr, log_nsr
 gamma_min: -5.
 gamma_max: 5.
+noise_proposal: tau  # tau, gamma_gumbel
+train_objective: vlb  # vlb, bounded_vlb, proposal_ce
+gamma_proposal_loc: 0.0
+gamma_proposal_scale: 1.0
+vlb_proposal_floor: 0.05
 train_loss: 'ce'  # 'ce' or 'l2'
 train_on_weighted_loss: True
 self_conditioning:

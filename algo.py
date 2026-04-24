@@ -1102,6 +1102,14 @@ class FLMVDM(FLM):
         self.cond_t = getattr(config.algo, 'cond_t', 'tau')
         self.gamma_min = getattr(config.algo, 'gamma_min', -5.)
         self.gamma_max = getattr(config.algo, 'gamma_max', 5.)
+        self.noise_proposal = getattr(config.algo, 'noise_proposal', 'tau')
+        self.train_objective = getattr(config.algo, 'train_objective', 'vlb')
+        self.gamma_proposal_loc = float(
+            getattr(config.algo, 'gamma_proposal_loc', 0.0))
+        self.gamma_proposal_scale = float(
+            getattr(config.algo, 'gamma_proposal_scale', 1.0))
+        self.vlb_proposal_floor = float(
+            getattr(config.algo, 'vlb_proposal_floor', 0.05))
         self.train_loss = getattr(config.algo, 'train_loss', 'ce')
         self.train_on_weighted_loss = getattr(config.algo, 'train_on_weighted_loss', True)
         self.diagnostic_num_bins = getattr(config.algo, 'diagnostic_num_bins', 8)
@@ -1114,6 +1122,7 @@ class FLMVDM(FLM):
             raise NotImplementedError(
                 "FLMVDM currently supports only interpolant_type='vp_vdm', "
                 f"got {self.interpolant_type}")
+        self._validate_proposal_config()
         if not 0.0 <= self.self_conditioning_train_prob <= 1.0:
             raise ValueError(
                 "self_conditioning.train_prob must be in [0, 1], "
@@ -1137,6 +1146,35 @@ class FLMVDM(FLM):
 
     def _d_gamma_by_d_tau(self, tau):
         return utils.d_tau_to_gamma(tau, self.lut_tau2gamma)
+
+    def _validate_proposal_config(self):
+        if self.noise_proposal not in {'tau', 'gamma_gumbel'}:
+            raise ValueError(
+                "algo.noise_proposal must be one of "
+                "{'tau', 'gamma_gumbel'}, "
+                f"got {self.noise_proposal}")
+        if self.train_objective not in {'vlb', 'bounded_vlb', 'proposal_ce'}:
+            raise ValueError(
+                "algo.train_objective must be one of "
+                "{'vlb', 'bounded_vlb', 'proposal_ce'}, "
+                f"got {self.train_objective}")
+        if self.noise_proposal == 'tau' and self.train_objective != 'vlb':
+            raise ValueError(
+                "algo.train_objective must be 'vlb' when "
+                "algo.noise_proposal='tau'")
+        if self.noise_proposal == 'gamma_gumbel' and self.train_objective == 'vlb':
+            raise ValueError(
+                "algo.train_objective='vlb' is only defined for "
+                "algo.noise_proposal='tau'; use 'bounded_vlb' for "
+                "importance-corrected gamma proposals")
+        if self.gamma_proposal_scale <= 0:
+            raise ValueError(
+                "algo.gamma_proposal_scale must be positive, "
+                f"got {self.gamma_proposal_scale}")
+        if not 0.0 < self.vlb_proposal_floor <= 1.0:
+            raise ValueError(
+                "algo.vlb_proposal_floor must be in (0, 1], "
+                f"got {self.vlb_proposal_floor}")
 
     def _get_noise_conditioning(self, tau_t, gamma):
         if self.cond_t == 'tau':
@@ -1182,16 +1220,38 @@ class FLMVDM(FLM):
         self._log_stage_metric(stage, f'{name}_max', values.max(),
                                group=group)
 
-    def _log_weight_diagnostics(self, stage, tau, gamma, snr_prime_tau,
-                                dgamma_dtau, loss_weight):
+    def _log_weight_diagnostics(self, stage, tau, gamma, snr, snr_width,
+                                snr_prime_tau, dgamma_dtau, loss_weight,
+                                train_weight, vlb_weight,
+                                normalized_vlb_weight,
+                                proposal_density=None,
+                                vlb_gamma_density=None):
         self._log_distribution_stats(stage, 'tau', tau, group='stats')
         self._log_distribution_stats(stage, 'gamma', gamma, group='stats')
+        self._log_distribution_stats(stage, 'snr', snr, group='stats')
+        self._log_distribution_stats(stage, 'snr_width', snr_width,
+                                     group='stats')
         self._log_distribution_stats(stage, 'snr_prime_tau', snr_prime_tau,
                                      group='stats')
         self._log_distribution_stats(stage, 'dgamma_dtau', dgamma_dtau,
                                      group='stats')
         self._log_distribution_stats(stage, 'loss_weight', loss_weight,
                                      group='stats')
+        self._log_distribution_stats(stage, 'train_weight', train_weight,
+                                     group='stats')
+        self._log_distribution_stats(stage, 'vlb_weight', vlb_weight,
+                                     group='stats')
+        self._log_distribution_stats(stage, 'normalized_vlb_weight',
+                                     normalized_vlb_weight,
+                                     group='stats')
+        if proposal_density is not None:
+            self._log_distribution_stats(stage, 'proposal_density',
+                                         proposal_density,
+                                         group='stats')
+        if vlb_gamma_density is not None:
+            self._log_distribution_stats(stage, 'vlb_gamma_density',
+                                         vlb_gamma_density,
+                                         group='stats')
 
         weight_sum = loss_weight.sum().clamp_min(1e-12)
         ess = weight_sum.square() / loss_weight.square().sum().clamp_min(1e-12)
@@ -1200,8 +1260,19 @@ class FLMVDM(FLM):
                                ess / max(loss_weight.numel(), 1),
                                group='stats')
 
+        vlb_weight_sum = vlb_weight.sum().clamp_min(1e-12)
+        vlb_ess = (
+            vlb_weight_sum.square()
+            / vlb_weight.square().sum().clamp_min(1e-12))
+        self._log_stage_metric(stage, 'vlb_weight_ess', vlb_ess,
+                               group='stats')
+        self._log_stage_metric(stage, 'vlb_weight_ess_frac',
+                               vlb_ess / max(vlb_weight.numel(), 1),
+                               group='stats')
+
     def _log_objective_diagnostics(self, stage, tau, target_data,
-                                   log_softmax_pred, loss_weight):
+                                   log_softmax_pred, vlb_weight,
+                                   train_weight):
         probs = log_softmax_pred.exp()
         ce_loss = -(target_data * log_softmax_pred).sum(dim=-1)
         l2_loss = ((target_data - probs) ** 2).sum(dim=-1)
@@ -1210,8 +1281,10 @@ class FLMVDM(FLM):
         target_tokens = target_data.argmax(dim=-1)
         token_accuracy = (pred_tokens == target_tokens).float()
 
-        broadcast_weight = loss_weight.expand_as(ce_loss)
+        broadcast_weight = vlb_weight.expand_as(ce_loss)
         weight_sum = broadcast_weight.sum().clamp_min(1e-12)
+        broadcast_train_weight = train_weight.expand_as(ce_loss)
+        train_weight_sum = broadcast_train_weight.sum().clamp_min(1e-12)
 
         self._log_stage_metric(
             stage, 'ce_weighted_normalized',
@@ -1221,12 +1294,26 @@ class FLMVDM(FLM):
             stage, 'l2_weighted_normalized',
             (0.5 * l2_loss * broadcast_weight).sum() / weight_sum,
             group='objective')
+        self._log_stage_metric(
+            stage, 'ce_train_weighted_normalized',
+            (ce_loss * broadcast_train_weight).sum() / train_weight_sum,
+            group='objective')
+        self._log_stage_metric(
+            stage, 'l2_train_weighted_normalized',
+            (0.5 * l2_loss * broadcast_train_weight).sum()
+            / train_weight_sum,
+            group='objective')
         self._log_stage_metric(stage, 'token_accuracy',
                                token_accuracy.mean(),
                                group='objective')
         self._log_stage_metric(
             stage, 'token_accuracy_weighted_normalized',
             (token_accuracy * broadcast_weight).sum() / weight_sum,
+            group='objective')
+        self._log_stage_metric(
+            stage, 'token_accuracy_train_weighted_normalized',
+            (token_accuracy * broadcast_train_weight).sum()
+            / train_weight_sum,
             group='objective')
         self._log_stage_metric(stage, 'true_token_prob_mean',
                                true_token_prob.mean(),
@@ -1239,7 +1326,7 @@ class FLMVDM(FLM):
             return
 
         ce_per_sample = ce_loss.mean(dim=-1)
-        weighted_ce_per_sample = ce_per_sample * loss_weight.squeeze(-1)
+        weighted_ce_per_sample = ce_per_sample * vlb_weight.squeeze(-1)
         token_accuracy_per_sample = token_accuracy.mean(dim=-1)
         num_bins = max(int(self.diagnostic_num_bins), 1)
         edges = torch.linspace(0.0, 1.0, num_bins + 1, device=tau.device)
@@ -1263,7 +1350,7 @@ class FLMVDM(FLM):
                     group='objective')
                 self._log_stage_metric(
                     stage, f'tau_bin_{bin_idx}_weight',
-                    loss_weight.squeeze(-1)[mask].mean(),
+                    vlb_weight.squeeze(-1)[mask].mean(),
                     group='objective')
                 self._log_stage_metric(
                     stage, f'tau_bin_{bin_idx}_weighted_ce',
@@ -1288,15 +1375,17 @@ class FLMVDM(FLM):
                 self._log_stage_metric(stage, f'tau_bin_{bin_idx}_accuracy', zero,
                                        group='objective')
     
-    def corrupt_continuous(self, x0, tau_t, gamma, dgamma_dtau, stage):
+    def corrupt_continuous(self, x0, tau_t, gamma, dgamma_dtau, stage,
+                           proposal_density=None, vlb_gamma_density=None):
         target_data = F.one_hot(x0, self.vocab_size).float()
         noise = torch.randn_like(target_data, dtype=torch.float32)
-
-        # Under VP parameterization, SNR(gamma) = exp(-gamma). Since tau is
-        # the primary sampled time coordinate, the Jacobian-aware weight is the
-        # positive derivative dSNR / dtau = -exp(-gamma) * dgamma / dtau.
-        snr_prime_tau = torch.exp(-gamma) * (-dgamma_dtau)
-        loss_weight = snr_prime_tau
+        train_weight, vlb_weight, diagnostics = self._compute_loss_weights(
+            tau_t,
+            gamma,
+            dgamma_dtau,
+            proposal_density=proposal_density,
+            vlb_gamma_density=vlb_gamma_density,
+        )
 
         alpha = torch.sigmoid(-gamma).sqrt().unsqueeze(-1).unsqueeze(-1)
         sigma = torch.sigmoid(gamma).sqrt().unsqueeze(-1).unsqueeze(-1)
@@ -1306,47 +1395,181 @@ class FLMVDM(FLM):
                                group='stats')
 
         x_t = alpha * target_data + sigma * noise
-        diagnostics = {
-            'tau': tau_t,
-            'gamma': gamma,
-            'snr_prime_tau': snr_prime_tau,
-            'dgamma_dtau': dgamma_dtau,
-            'loss_weight': loss_weight,
-        }
         cond_t = self._get_noise_conditioning(tau_t, gamma)
-        return x_t, cond_t, target_data, loss_weight.unsqueeze(-1), diagnostics
+        return (
+            x_t,
+            cond_t,
+            target_data,
+            train_weight.unsqueeze(-1),
+            vlb_weight.unsqueeze(-1),
+            diagnostics,
+        )
     
-    def _ce_loss(self, target_data, log_softmax_pred, loss_weight, stage):
+    def _ce_loss(self, target_data, log_softmax_pred, vlb_weight,
+                 train_weight, stage):
         loss = -(target_data * log_softmax_pred).sum(dim=-1)
         self._log_stage_metric(stage, 'ce_unweighted',
                                loss.mean().detach(),
                                group='objective')
         self._log_stage_metric(stage, 'ce_weighted',
-                               (loss * loss_weight).mean().detach(),
+                               (loss * vlb_weight).mean().detach(),
                                group='objective')
-        return loss, loss_weight
+        self._log_stage_metric(stage, 'ce_train_weighted',
+                               (loss * train_weight).mean().detach(),
+                               group='objective')
+        return loss, train_weight
 
-    def _l2_loss(self, target_data, log_softmax_pred, loss_weight, stage):
+    def _l2_loss(self, target_data, log_softmax_pred, vlb_weight,
+                 train_weight, stage):
         loss = ((target_data - log_softmax_pred.exp()) ** 2).sum(dim=-1)
         self._log_stage_metric(stage, 'l2_unweighted',
                                loss.mean().detach(),
                                group='objective')
         self._log_stage_metric(stage, 'l2_weighted',
-                               (0.5 * loss * loss_weight).mean().detach(),
+                               (0.5 * loss * vlb_weight).mean().detach(),
                                group='objective')
-        return loss, 0.5 * loss_weight
+        self._log_stage_metric(stage, 'l2_train_weighted',
+                               (0.5 * loss * train_weight).mean().detach(),
+                               group='objective')
+        return loss, 0.5 * train_weight
+
+    def _gamma_support(self, device, dtype):
+        gamma_min = torch.tensor(self.gamma_min, device=device, dtype=dtype)
+        gamma_max = torch.tensor(self.gamma_max, device=device, dtype=dtype)
+        return gamma_min, gamma_max
+
+    def _snr_width(self, device, dtype):
+        gamma_min, gamma_max = self._gamma_support(device, dtype)
+        return (torch.exp(-gamma_min) - torch.exp(-gamma_max)).clamp_min(1e-12)
+
+    def _truncated_gumbel_cdf(self, gamma, loc, scale):
+        z = (gamma - loc) / scale
+        return torch.exp(-torch.exp(-z))
+
+    def _truncated_gumbel_pdf(self, gamma, loc, scale,
+                              gamma_min, gamma_max):
+        z = (gamma - loc) / scale
+        pdf = torch.exp(-(z + torch.exp(-z))) / scale
+        cdf_min = self._truncated_gumbel_cdf(gamma_min, loc, scale)
+        cdf_max = self._truncated_gumbel_cdf(gamma_max, loc, scale)
+        return pdf / (cdf_max - cdf_min).clamp_min(1e-12)
+
+    def _sample_truncated_gumbel_gamma(self, unit):
+        dtype = unit.dtype
+        device = unit.device
+        work_unit = unit.double()
+        gamma_min, gamma_max = self._gamma_support(device, torch.float64)
+        loc = torch.tensor(self.gamma_proposal_loc, device=device,
+                           dtype=torch.float64)
+        scale = torch.tensor(self.gamma_proposal_scale, device=device,
+                             dtype=torch.float64)
+        cdf_min = self._truncated_gumbel_cdf(gamma_min, loc, scale)
+        cdf_max = self._truncated_gumbel_cdf(gamma_max, loc, scale)
+        u = cdf_min + work_unit * (cdf_max - cdf_min)
+        u = u.clamp(1e-12, 1.0 - 1e-7)
+        gamma = loc - scale * torch.log(-torch.log(u))
+        return gamma.to(dtype=dtype)
+
+    def _sample_vlb_gamma(self, unit):
+        dtype = unit.dtype
+        device = unit.device
+        gamma_min, gamma_max = self._gamma_support(device, dtype)
+        snr_max = torch.exp(-gamma_min)
+        snr_min = torch.exp(-gamma_max)
+        snr = snr_max - unit * (snr_max - snr_min)
+        return -torch.log(snr.clamp_min(1e-12))
+
+    def _vlb_gamma_density(self, gamma):
+        snr_width = self._snr_width(gamma.device, gamma.dtype)
+        return torch.exp(-gamma) / snr_width
+
+    def _proposal_gamma_density(self, gamma):
+        gamma_min, gamma_max = self._gamma_support(gamma.device, gamma.dtype)
+        loc = torch.tensor(self.gamma_proposal_loc, device=gamma.device,
+                           dtype=gamma.dtype)
+        scale = torch.tensor(self.gamma_proposal_scale, device=gamma.device,
+                             dtype=gamma.dtype)
+        gumbel_density = self._truncated_gumbel_pdf(
+            gamma, loc, scale, gamma_min, gamma_max)
+        vlb_density = self._vlb_gamma_density(gamma)
+        floor = self.vlb_proposal_floor
+        proposal_density = floor * vlb_density + (1.0 - floor) * gumbel_density
+        return proposal_density, vlb_density
+
+    def _sample_gamma_proposal(self, B, accum_step):
+        mix_unit = self._sample_t_interval(
+            B, accum_step, t_min=0.0, t_max=1.0)
+        sample_unit = self._sample_t_interval(
+            B, accum_step, t_min=0.0, t_max=1.0)
+        gamma_gumbel = self._sample_truncated_gumbel_gamma(sample_unit)
+        gamma_vlb = self._sample_vlb_gamma(sample_unit)
+        use_vlb_component = mix_unit < self.vlb_proposal_floor
+        gamma = torch.where(use_vlb_component, gamma_vlb, gamma_gumbel)
+        proposal_density, vlb_density = self._proposal_gamma_density(gamma)
+        return gamma, proposal_density, vlb_density
+
+    def _compute_loss_weights(self, tau_t, gamma, dgamma_dtau,
+                              proposal_density=None,
+                              vlb_gamma_density=None):
+        snr = torch.exp(-gamma)
+        snr_width = self._snr_width(gamma.device, gamma.dtype)
+        # Positive derivative dSNR / dtau under the VP parameterization.
+        snr_prime_tau = snr * (-dgamma_dtau)
+
+        if proposal_density is None:
+            vlb_weight = snr_prime_tau
+            normalized_vlb_weight = vlb_weight / snr_width
+        else:
+            normalized_vlb_weight = (
+                vlb_gamma_density
+                / proposal_density.clamp_min(1e-12))
+            vlb_weight = snr_width * normalized_vlb_weight
+
+        if not self.training or self.train_objective == 'vlb':
+            train_weight = vlb_weight
+        elif self.train_objective == 'bounded_vlb':
+            train_weight = normalized_vlb_weight
+        elif self.train_objective == 'proposal_ce':
+            train_weight = torch.ones_like(vlb_weight)
+        else:
+            raise ValueError(f"Unknown train_objective: {self.train_objective}")
+
+        diagnostics = {
+            'tau': tau_t,
+            'gamma': gamma,
+            'snr': snr,
+            'snr_width': snr_width,
+            'snr_prime_tau': snr_prime_tau,
+            'dgamma_dtau': dgamma_dtau,
+            'loss_weight': train_weight,
+            'train_weight': train_weight,
+            'vlb_weight': vlb_weight,
+            'normalized_vlb_weight': normalized_vlb_weight,
+            'proposal_density': proposal_density,
+            'vlb_gamma_density': vlb_gamma_density,
+        }
+        return train_weight, vlb_weight, diagnostics
 
     def _sample_tau_coordinates(self, B, accum_step):
-        t_min, t_max = (self.train_t_min, self.train_t_max) if self.training else (self.val_t_min, self.val_t_max)
-        tau_t = self._sample_t_interval(
-            B,
-            accum_step,
-            t_min=t_min,
-            t_max=t_max,
-        )
-        gamma = self._tau_to_gamma(tau_t)
+        if self.training and self.noise_proposal == 'gamma_gumbel':
+            gamma, proposal_density, vlb_gamma_density = (
+                self._sample_gamma_proposal(B, accum_step))
+            tau_t = self._gamma_to_tau(gamma)
+        else:
+            t_min, t_max = (
+                (self.train_t_min, self.train_t_max)
+                if self.training else (self.val_t_min, self.val_t_max))
+            tau_t = self._sample_t_interval(
+                B,
+                accum_step,
+                t_min=t_min,
+                t_max=t_max,
+            )
+            gamma = self._tau_to_gamma(tau_t)
+            proposal_density = None
+            vlb_gamma_density = None
         dgamma_dtau = self._d_gamma_by_d_tau(tau_t)
-        return tau_t, gamma, dgamma_dtau
+        return tau_t, gamma, dgamma_dtau, proposal_density, vlb_gamma_density
 
     def _build_self_conditioning(self, x_t, cond_t, self_cond_mask=None):
         if not self.self_conditioning_enabled:
@@ -1373,11 +1596,20 @@ class FLMVDM(FLM):
         del given_t, not_sampling_t, output_tokens
         stage = 'train' if self.training else 'val'
         B = x0.shape[0]
-        tau_t, gamma, dgamma_dtau = self._sample_tau_coordinates(
-            B, current_accumulation_step)
+        (tau_t, gamma, dgamma_dtau, proposal_density,
+         vlb_gamma_density) = self._sample_tau_coordinates(
+             B, current_accumulation_step)
 
-        x_t, cond_t, target_data, loss_weight, diagnostics = self.corrupt_continuous(
-            x0, tau_t, gamma, dgamma_dtau, stage)
+        (x_t, cond_t, target_data, train_weight, vlb_weight,
+         diagnostics) = self.corrupt_continuous(
+             x0,
+             tau_t,
+             gamma,
+             dgamma_dtau,
+             stage,
+             proposal_density=proposal_density,
+             vlb_gamma_density=vlb_gamma_density,
+         )
         self_cond = None
         if self.self_conditioning_enabled:
             if self.training:
@@ -1404,15 +1636,20 @@ class FLMVDM(FLM):
         f = self.forward(x_t, cond_t, self_cond=self_cond)
         self._log_weight_diagnostics(stage, **diagnostics)
         self._log_objective_diagnostics(stage, diagnostics['tau'],
-                                        target_data, f, loss_weight)
+                                        target_data, f, vlb_weight,
+                                        train_weight)
         if self.train_loss == 'ce':
             with torch.no_grad():
-                _, _ = self._l2_loss(target_data, f, loss_weight, stage)
-            loss, loss_weight = self._ce_loss(target_data, f, loss_weight, stage)
+                _, _ = self._l2_loss(target_data, f, vlb_weight,
+                                     train_weight, stage)
+            loss, loss_weight = self._ce_loss(target_data, f, vlb_weight,
+                                             train_weight, stage)
         elif self.train_loss == 'l2':
             with torch.no_grad():
-                _, _ = self._ce_loss(target_data, f, loss_weight, stage)
-            loss, loss_weight = self._l2_loss(target_data, f, loss_weight, stage)
+                _, _ = self._ce_loss(target_data, f, vlb_weight,
+                                     train_weight, stage)
+            loss, loss_weight = self._l2_loss(target_data, f, vlb_weight,
+                                             train_weight, stage)
         else:
             raise NotImplementedError(f"Train loss {self.train_loss} not implemented!")
         self.log('loss', loss.mean(), prog_bar=True)
