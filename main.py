@@ -427,12 +427,16 @@ def main(config):
         diffusion_model = algo.DUO
     elif config.algo.name == 'flm':
         diffusion_model = algo.FLM
+    elif config.algo.name == 'flm_block':
+        diffusion_model = algo.FLMBlock
     elif config.algo.name == 'fmlm_twomodel':
         diffusion_model = algo.FMLM_TwoModel
     elif config.algo.name == 'fmlm_twostage':
         diffusion_model = algo.FMLM_TwoStage
     elif config.algo.name == 'fmlm':
         diffusion_model = algo.FMLM
+    elif config.algo.name == 'fmlm_block':
+        diffusion_model = algo.FMLMBlock
     elif config.algo.name == 'd3pm':
         diffusion_model = algo.D3PMAbsorb
     elif config.algo.name == 'sedd':

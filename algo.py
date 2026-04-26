@@ -1081,7 +1081,231 @@ class FLM(FLMBase):
             z = z + dt.view(-1, 1, 1) * v
 
         return z.argmax(dim=-1)
-    
+
+
+class FLMBlock(FLM):
+    """Blockwise FLM with duplicated clean/noisy streams.
+
+    The model input has length 2L. The first half is clean block context, the
+    second half is the noisy target stream. Losses and samples are taken only
+    from the noisy half.
+    """
+
+    def __init__(self, config, tokenizer):
+        super().__init__(config, tokenizer)
+        self.block_size = int(config.algo.block_size)
+        self._validate_block_configuration()
+        self._block_attention_mask_cache = {}
+        self._block_position_ids_cache = {}
+
+    def _validate_block_configuration(self):
+        assert self.block_size > 0, "block_size must be positive"
+        assert self.num_tokens % self.block_size == 0, \
+            "model.length must be divisible by block_size"
+        assert not self.config.algo.causal_attention, \
+            "FLMBlock requires non-causal DIT attention with a block mask"
+
+    def _num_blocks(self, block_size=None):
+        if block_size is None:
+            block_size = self.block_size
+        return self.num_tokens // block_size
+
+    def _block_attention_mask(self, block_size=None, device=None):
+        if block_size is None:
+            block_size = self.block_size
+        if device is None:
+            device = self.device
+        key = (block_size, device)
+        cached = self._block_attention_mask_cache.get(key)
+        if cached is not None:
+            return cached
+
+        L = self.num_tokens
+        S = 2 * L
+        token_ids = torch.arange(S, device=device)
+        query_is_noisy = token_ids >= L
+        key_is_noisy = query_is_noisy
+        query_block = (token_ids % L) // block_size
+        key_block = query_block
+
+        q_noisy = query_is_noisy[:, None]
+        k_noisy = key_is_noisy[None, :]
+        q_block = query_block[:, None]
+        k_block = key_block[None, :]
+
+        clean_query = (~q_noisy) & (~k_noisy) & (k_block <= q_block)
+        noisy_query_clean_context = q_noisy & (~k_noisy) & (k_block < q_block)
+        noisy_query_same_block = q_noisy & k_noisy & (k_block == q_block)
+        mask = clean_query | noisy_query_clean_context | noisy_query_same_block
+        self._block_attention_mask_cache[key] = mask
+        return mask
+
+    def _block_position_ids(self, device=None):
+        if device is None:
+            device = self.device
+        cached = self._block_position_ids_cache.get(device)
+        if cached is not None:
+            return cached
+        pos = torch.arange(self.num_tokens, device=device)
+        pos = torch.cat([pos, pos], dim=0)
+        self._block_position_ids_cache[device] = pos
+        return pos
+
+    def _sample_block_tau(self, n, accum_step, block_size=None,
+                          t_min=None, t_max=None):
+        if block_size is None:
+            block_size = self.block_size
+        if t_min is None:
+            t_min = self.t_min
+        if t_max is None:
+            t_max = self.t_max
+        num_blocks = self._num_blocks(block_size)
+        if accum_step is not None:
+            batch_dim = n
+            n = self.config.loader.global_batch_size
+        total = n * num_blocks
+        eps_t = torch.rand(total, device=self.device)
+        if self.antithetic_sampling:
+            offset = torch.arange(total, device=self.device) / total
+            eps_t = (eps_t / total + offset) % 1
+            perm = torch.randperm(total, device=self.device)
+            eps_t = eps_t[perm]
+        tau = ((t_max - t_min) * eps_t + t_min).view(n, num_blocks)
+        if accum_step is not None:
+            tau = tau.chunk(self.trainer.num_nodes)[self.trainer.node_rank]
+            tau = tau.chunk(self.trainer.num_devices)[self.trainer.local_rank]
+            tau = tau.chunk(self.trainer.accumulate_grad_batches)[accum_step]
+            tau = tau[:batch_dim]
+        return tau
+
+    def _sample_two_block_tau(self, n, accum_step, block_size=None):
+        tau_a = self._sample_block_tau(n, accum_step, block_size)
+        tau_b = self._sample_block_tau(n, accum_step, block_size)
+        tau_s = torch.minimum(tau_a, tau_b)
+        tau_t = torch.maximum(tau_a, tau_b)
+        return tau_s, tau_t
+
+    def _tau_blocks_to_tokens(self, tau, block_size=None):
+        if block_size is None:
+            block_size = self.block_size
+        if tau.ndim == 1:
+            tau = tau[:, None].expand(-1, self._num_blocks(block_size))
+        return tau.repeat_interleave(block_size, dim=1)
+
+    def _block_t_to_tokens(self, t, block_size=None):
+        if block_size is None:
+            block_size = self.block_size
+        if t.ndim == 1:
+            t = t[:, None].expand(-1, self._num_blocks(block_size))
+        return t.repeat_interleave(block_size, dim=1)
+
+    def corrupt_continuous_blocks(self, x0, tau, block_size=None):
+        if block_size is None:
+            block_size = self.block_size
+        t = self._tau_to_t(tau.reshape(-1)).view_as(tau)
+        t_tokens = self._block_t_to_tokens(t, block_size)
+        target_data = F.one_hot(x0, self.vocab_size).float()
+        noise = torch.randn_like(target_data, dtype=torch.float32)
+        x_t = ((1 - t_tokens[:, :, None]) * noise
+               + t_tokens[:, :, None] * target_data)
+        return x_t, target_data
+
+    def _block_forward_model(self, model, noisy_tokens, clean_tokens,
+                             tau, tau_prime=None, use_jvp_attn=False,
+                             block_size=None):
+        if block_size is None:
+            block_size = self.block_size
+        clean = F.one_hot(clean_tokens, self.vocab_size).to(noisy_tokens.dtype)
+        x_full = torch.cat([clean, noisy_tokens], dim=1)
+        tau_tokens = self._tau_blocks_to_tokens(tau, block_size)
+        tau_full = torch.cat([torch.zeros_like(tau_tokens), tau_tokens], dim=1)
+        tau_prime_full = None
+        if tau_prime is not None:
+            tau_prime_tokens = self._tau_blocks_to_tokens(tau_prime, block_size)
+            tau_prime_full = torch.cat(
+                [torch.zeros_like(tau_prime_tokens), tau_prime_tokens], dim=1)
+        with torch.amp.autocast(device_type=self.device.type, dtype=torch.float32):
+            model_output = model(
+                x_full,
+                tau_full,
+                tau_prime_full,
+                use_jvp_attn=use_jvp_attn,
+                attention_mask=self._block_attention_mask(block_size, x_full.device),
+                position_ids=self._block_position_ids(x_full.device))
+        model_output = self._process_model_output(
+            model_output=model_output, xt=x_full, sigma=tau_full)
+        return model_output[:, self.num_tokens:]
+
+    def _block_forward(self, noisy_tokens, clean_tokens, tau, tau_prime=None,
+                       use_jvp_attn=False, block_size=None):
+        return self._block_forward_model(
+            self.backbone, noisy_tokens, clean_tokens, tau, tau_prime,
+            use_jvp_attn=use_jvp_attn, block_size=block_size)
+
+    def loss(self, x0, output_tokens,
+             current_accumulation_step=None, train_mode=False,
+             xT=None, given_t=None, not_sampling_t=False):
+        del given_t, not_sampling_t, output_tokens, train_mode, xT
+        B = x0.shape[0]
+        block_size = self.block_size
+        tau_t = self._sample_block_tau(B, current_accumulation_step, block_size)
+        x_t, target_data = self.corrupt_continuous_blocks(x0, tau_t, block_size)
+        f = self._block_forward(x_t, x0, tau_t, block_size=block_size)
+        loss = -(target_data * f).sum(dim=-1)
+        self.log('loss', loss.mean(), prog_bar=True)
+        if self.config.algo.learnable_loss_weighting is True:
+            tau_for_weight = tau_t.mean(dim=1)
+            loss_weight = self.backbone.learnable_loss_weighting(tau_for_weight)
+            loss_weight = loss_weight.unsqueeze(-1)
+            loss = torch.exp(-loss_weight) * loss + loss_weight
+            self.log('loss_weighted', loss.mean(), prog_bar=True)
+        return loss
+
+    @torch.no_grad()
+    def generate_samples(self, num_samples, num_steps=None, eps=1e-5):
+        """Generate samples block-by-block using the FLM Euler solver."""
+        del eps
+        if num_steps is None:
+            num_steps = self.config.sampling.steps
+        B = num_samples
+        L = self.num_tokens
+        V = self.vocab_size
+        block_size = self.block_size
+        num_blocks = self._num_blocks(block_size)
+        device = self.device
+        tokens = torch.zeros((B, L), dtype=torch.long, device=device)
+        tau_vals = torch.linspace(0.0, 1.0, num_steps + 1, device=device)
+
+        for block_idx in range(num_blocks):
+            start = block_idx * block_size
+            end = start + block_size
+            z_block = torch.randn((B, block_size, V), device=device,
+                                  dtype=self.dtype)
+            for i in range(num_steps):
+                tau_curr = tau_vals[i]
+                tau_next = tau_vals[i + 1]
+                tau_blocks = torch.zeros((B, num_blocks), device=device)
+                tau_blocks[:, block_idx] = tau_curr
+                tau_next_blocks = torch.zeros((B, num_blocks), device=device)
+                tau_next_blocks[:, block_idx] = tau_next
+                t_in = self._tau_to_t(tau_curr.expand(B))
+                dt = self._tau_to_t(tau_next.expand(B)) - t_in
+
+                noisy = torch.zeros((B, L, V), device=device, dtype=self.dtype)
+                noisy[:, start:end] = z_block
+                log_pred = self._block_forward(
+                    noisy, tokens, tau_blocks, block_size=block_size)
+                pred = log_pred[:, start:end].exp()
+                if i == num_steps - 1:
+                    z_block = pred
+                    break
+                v = (pred - z_block) / (1.0 - t_in.view(-1, 1, 1) + 1e-5)
+                z_block = z_block + dt.view(-1, 1, 1) * v
+
+            tokens[:, start:end] = z_block.argmax(dim=-1)
+        return tokens
+
+
 class FMLM(FLMBase):
     def __init__(self, config, tokenizer):
         super().__init__(config, tokenizer)
@@ -1564,6 +1788,270 @@ class FMLM(FLMBase):
                 z = z_tilde
                 
         return z.argmax(dim=-1)
+
+
+class FMLMBlock(FMLM, FLMBlock):
+    """Blockwise FMLM with PSD flow-map distillation."""
+
+    def __init__(self, config, tokenizer):
+        FMLM.__init__(self, config, tokenizer)
+        self.block_size = int(config.algo.block_size)
+        self._validate_block_configuration()
+        self._block_attention_mask_cache = {}
+        self._block_position_ids_cache = {}
+
+    def _validate_configuration(self):
+        super()._validate_configuration()
+        assert self.config.algo.distillation_method == "PSD", \
+            "FMLMBlock currently supports PSD distillation"
+
+    def teacher_forward(self, xt, tau=None, d=None, use_jvp_attn=False,
+                        clean_tokens=None, block_size=None):
+        del d
+        if clean_tokens is None:
+            return super().teacher_forward(
+                xt, tau=tau, use_jvp_attn=use_jvp_attn)
+        with torch.no_grad():
+            return self._block_forward_model(
+                self.teacher_model, xt, clean_tokens, tau,
+                use_jvp_attn=use_jvp_attn, block_size=block_size)
+
+    def _block_forward_with_ema(self, noisy_tokens, clean_tokens,
+                                tau, tau_prime=None, block_size=None):
+        ema_to_use = self.ema
+        assert ema_to_use is not None, "EMA must be available"
+        ema_to_use.store(self._get_parameters())
+        ema_to_use.copy_to(self._get_parameters())
+        try:
+            with torch.no_grad():
+                self.backbone.eval()
+                return self._block_forward(
+                    noisy_tokens, clean_tokens, tau, tau_prime,
+                    block_size=block_size)
+        finally:
+            ema_to_use.restore(self._get_parameters())
+            self.backbone.train()
+
+    def _sample_fmlm_block_times(self, n, accum_step, block_size):
+        tau_diag = self._sample_block_tau(
+            n, accum_step, block_size, t_min=self.t_min, t_max=self.t_max)
+        set_midpoint = getattr(self.config.algo, 'set_midpoint', 'midpoint')
+        if self.config.algo.offdiagonal_sampling == "uniform_st":
+            tau_s_offdiag, tau_t_offdiag = self._sample_two_block_tau(
+                n, accum_step, block_size)
+        else:
+            tau_d_offdiag = self._sample_block_tau(
+                n, accum_step, block_size, t_min=self.t_min, t_max=self.t_max)
+            tau_s_offdiag = self._sample_block_tau(
+                n, accum_step, block_size, t_min=self.t_min, t_max=self.t_max)
+            tau_s_offdiag = tau_s_offdiag * (1 - tau_d_offdiag)
+            tau_t_offdiag = tau_s_offdiag + tau_d_offdiag
+
+        idx_diag, idx_offdiag_bndry, idx_offdiag = self._get_split_indices(
+            n, accum_step,
+            ratios=(self.config.algo.diagonal_fraction,
+                    (1.0 - self.config.algo.diagonal_fraction)
+                    * (1.0 / self.config.algo.boundary_prob)))
+
+        num_blocks = self._num_blocks(block_size)
+        tau_s = torch.zeros((n, num_blocks), device=self.device)
+        tau_t = torch.zeros((n, num_blocks), device=self.device)
+        tau_s[idx_diag] = tau_diag[idx_diag]
+        tau_s[idx_offdiag_bndry] = 0.0
+        tau_s[idx_offdiag] = tau_s_offdiag[idx_offdiag]
+        tau_t[idx_diag] = tau_diag[idx_diag]
+        tau_t[idx_offdiag_bndry] = 1.0
+        tau_t[idx_offdiag] = tau_t_offdiag[idx_offdiag]
+        tau_s = torch.clamp(tau_s, 0.0, 1.0)
+        tau_t = torch.clamp(tau_t, 0.0, 1.0)
+
+        if set_midpoint == 'midpoint':
+            tau_u = 0.5 * (tau_s + tau_t)
+        else:
+            tau_u = tau_s + torch.rand_like(tau_s) * (tau_t - tau_s)
+
+        idx_offdiag = torch.cat([idx_offdiag, idx_offdiag_bndry])
+        return tau_s, tau_u, tau_t, idx_diag, idx_offdiag
+
+    def loss(self, x1, output_tokens,
+             current_accumulation_step=None, train_mode=False, xT=None,
+             given_t=None, not_sampling_t=False):
+        del given_t, not_sampling_t, output_tokens, train_mode, xT
+        B, L = x1.shape[0], x1.shape[1]
+        block_size = self.block_size
+        tau_s, tau_u, tau_t, idx_diag, idx_offdiag = (
+            self._sample_fmlm_block_times(
+                B, current_accumulation_step, block_size))
+
+        has_diag = idx_diag.numel() > 0
+        has_offdiag = idx_offdiag.numel() > 0
+
+        s = self._tau_to_t(tau_s.reshape(-1)).view_as(tau_s)
+        u = self._tau_to_t(tau_u.reshape(-1)).view_as(tau_u)
+        t = self._tau_to_t(tau_t.reshape(-1)).view_as(tau_t)
+        x_s, target_data = self.corrupt_continuous_blocks(
+            x1, tau_s, block_size)
+
+        if self.teacher_model is None or not has_diag:
+            on_diagonal_target = target_data[idx_diag]
+        else:
+            on_diagonal_target = self.teacher_forward(
+                x_s[idx_diag], tau=tau_s[idx_diag],
+                clean_tokens=x1[idx_diag], block_size=block_size).exp()
+        on_diagonal_target = stopgrad(on_diagonal_target)
+
+        log_D_st = self._block_forward(
+            x_s, x1, tau_s, tau_t, block_size=block_size)
+        _fwd = (self._block_forward_with_ema
+                if getattr(self.config.algo, 'use_ema_for_psd_target', False)
+                else self._block_forward)
+
+        if has_offdiag:
+            with torch.no_grad():
+                x_s_od = x_s[idx_offdiag]
+                x1_od = x1[idx_offdiag]
+                s_od = self._block_t_to_tokens(
+                    s[idx_offdiag], block_size)[:, :, None]
+                u_od = self._block_t_to_tokens(
+                    u[idx_offdiag], block_size)[:, :, None]
+                t_od = self._block_t_to_tokens(
+                    t[idx_offdiag], block_size)[:, :, None]
+                tau_s_od = tau_s[idx_offdiag]
+                tau_u_od = tau_u[idx_offdiag]
+                tau_t_od = tau_t[idx_offdiag]
+
+                D_su_offdiag = _fwd(
+                    x_s_od, x1_od, tau_s_od, tau_u_od,
+                    block_size=block_size).exp()
+                X_su = ((1 - u_od) / (1 - s_od + 1e-8)) * x_s_od \
+                       + ((u_od - s_od) / (1 - s_od + 1e-8)) * D_su_offdiag
+                D_ut_offdiag = _fwd(
+                    X_su, x1_od, tau_u_od, tau_t_od,
+                    block_size=block_size).exp()
+                lambda_sut = ((1 - t_od) * (u_od - s_od)
+                              / ((1 - u_od) * (t_od - s_od) + 1e-8))
+                offdiag_target = stopgrad(
+                    lambda_sut * D_su_offdiag
+                    + (1 - lambda_sut) * D_ut_offdiag)
+
+            if not self.config.algo.use_mse_loss_psd:
+                offdiag_loss = -(
+                    offdiag_target * log_D_st[idx_offdiag]).sum(dim=-1)
+            else:
+                offdiag_loss = F.mse_loss(
+                    log_D_st[idx_offdiag].exp(), offdiag_target,
+                    reduction='none').sum(dim=-1)
+            if self.config.algo.rescale_offdiag_loss_psd is True:
+                offdiag_loss = offdiag_loss * (
+                    (t_od - s_od) / (1 - s_od + 1e-8)).squeeze(-1).pow(2)
+        else:
+            offdiag_loss = x_s.new_empty((0, L))
+
+        if has_diag:
+            if not self.config.algo.use_mse_loss_psd:
+                diag_loss = -(
+                    on_diagonal_target * log_D_st[idx_diag]).sum(dim=-1)
+            else:
+                diag_loss = F.mse_loss(
+                    log_D_st[idx_diag].exp(), on_diagonal_target,
+                    reduction='none').sum(dim=-1)
+        else:
+            diag_loss = x_s.new_empty((0, L))
+
+        loss = torch.zeros(B, L, device=self.device)
+        if has_diag:
+            loss[idx_diag] = diag_loss
+            diag_loss_to_log = diag_loss.mean()
+        else:
+            diag_loss_to_log = loss.new_tensor(0.0)
+        self.log('diag_loss', diag_loss_to_log, prog_bar=True, sync_dist=True)
+
+        if has_offdiag:
+            loss[idx_offdiag] = offdiag_loss
+            offdiag_loss_to_log = offdiag_loss.mean()
+        else:
+            offdiag_loss_to_log = loss.new_tensor(0.0)
+        self.log('offdiag_loss', offdiag_loss_to_log, prog_bar=True,
+                 sync_dist=True)
+        self.log('loss', loss.mean(), prog_bar=True, sync_dist=True)
+
+        if self.config.algo.learnable_loss_weighting is True:
+            tau_s_for_weight = tau_s.mean(dim=1)
+            tau_t_for_weight = tau_t.mean(dim=1)
+            loss_weight = self.backbone.learnable_loss_weighting(
+                tau_s_for_weight, tau_t_for_weight)
+            loss_weight = loss_weight.unsqueeze(-1)
+            loss = torch.exp(-loss_weight) * loss + loss_weight
+            self.log('loss_weighted', loss.mean(), prog_bar=True,
+                     sync_dist=True)
+        return loss
+
+    @torch.no_grad()
+    def generate_samples(self, num_samples, num_steps=None, eps=1e-5):
+        del eps
+        if num_steps is None:
+            num_steps = self.config.sampling.steps
+        gamma = getattr(self.config.sampling, 'gamma', 0.0)
+        print(f"Sampling with {num_steps} steps")
+
+        B = num_samples
+        L = self.num_tokens
+        V = self.vocab_size
+        block_size = self.block_size
+        num_blocks = self._num_blocks(block_size)
+        device = self.device
+        tokens = torch.zeros((B, L), dtype=torch.long, device=device)
+        tau_vals = torch.linspace(0.0, 1.0, num_steps + 1, device=device)
+
+        for block_idx in range(num_blocks):
+            start = block_idx * block_size
+            end = start + block_size
+            z_block = torch.randn((B, block_size, V), device=device,
+                                  dtype=self.dtype)
+            for i in range(num_steps):
+                tau_curr = tau_vals[i]
+                tau_next = tau_vals[i + 1]
+                t_curr = self._tau_to_t(tau_curr.expand(B))
+                t_next = self._tau_to_t(tau_next.expand(B))
+                sigma_target = 1.0 - t_next
+                sigma_tilde = sigma_target * torch.sqrt(
+                    torch.tensor(1.0 - gamma**2, device=device))
+                t_tilde = 1.0 - sigma_tilde
+                tau_tilde = self._t_to_tau(t_tilde)
+
+                tau_blocks = torch.zeros((B, num_blocks), device=device)
+                tau_blocks[:, block_idx] = tau_curr
+                tau_tilde_blocks = torch.zeros((B, num_blocks), device=device)
+                tau_tilde_blocks[:, block_idx] = tau_tilde
+
+                noisy = torch.zeros((B, L, V), device=device, dtype=self.dtype)
+                noisy[:, start:end] = z_block
+                log_pred = self._block_forward(
+                    noisy, tokens, tau_blocks, tau_tilde_blocks,
+                    block_size=block_size)
+                pred = log_pred[:, start:end].exp()
+                if i == num_steps - 1:
+                    z_block = pred
+                    break
+
+                weight_z = ((1.0 - t_tilde.view(-1, 1, 1))
+                            / (1.0 - t_curr.view(-1, 1, 1)))
+                weight_D = ((t_tilde.view(-1, 1, 1)
+                             - t_curr.view(-1, 1, 1))
+                            / (1.0 - t_curr.view(-1, 1, 1)))
+                z_tilde = weight_z * z_block + weight_D * pred
+                if gamma > 0:
+                    noise_std = gamma * sigma_target.view(-1, 1, 1)
+                    mean_adjustment = (
+                        sigma_tilde.view(-1, 1, 1)
+                        - sigma_target.view(-1, 1, 1))
+                    z_block = (z_tilde + mean_adjustment * pred
+                               + noise_std * torch.randn_like(z_block))
+                else:
+                    z_block = z_tilde
+
+            tokens[:, start:end] = z_block.argmax(dim=-1)
+        return tokens
 
 
 class FMLM_TwoModel(FLMBase):

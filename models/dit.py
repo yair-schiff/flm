@@ -101,7 +101,21 @@ class Rotary(torch.nn.Module):
         self.cos_cached = None
         self.sin_cached = None
 
-    def forward(self, x, seq_dim=1):
+    def forward(self, x, seq_dim=1, position_ids=None):
+        if position_ids is not None:
+            position_ids = position_ids.to(device=x.device)
+            if position_ids.ndim == 2:
+                position_ids = position_ids[0]
+            freqs = torch.einsum(
+                "i,j->ij", position_ids.type_as(self.inv_freq),
+                self.inv_freq.clone())
+            emb = torch.cat((freqs, freqs), dim=-1).to(x.device)
+            cos = emb.cos()[None, :, None, None, :].repeat(1, 1, 3, 1, 1)
+            sin = emb.sin()[None, :, None, None, :].repeat(1, 1, 3, 1, 1)
+            cos[:, :, 2, :, :].fill_(1.)
+            sin[:, :, 2, :, :].fill_(0.)
+            return cos, sin
+
         seq_len = x.shape[seq_dim]
         if seq_len != self.seq_len_cached:
             self.seq_len_cached = seq_len
@@ -272,8 +286,12 @@ class TimestepEmbedder(nn.Module):
         return embedding
 
     def forward(self, t):
+        original_shape = t.shape
+        t = t.reshape(-1)
         t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
         t_emb = self.mlp(t_freq)
+        if len(original_shape) > 1:
+            t_emb = t_emb.view(*original_shape, -1)
         return t_emb
 
 class SquaredReLU(nn.Module):
@@ -445,17 +463,29 @@ class DDiTBlock(nn.Module):
         else:
             return bias_dropout_add_scale_fused_inference
     
-    def custom_sdpa(self, q, k, v, softcap=-1.0):
+    def custom_sdpa(self, q, k, v, softcap=-1.0, attention_mask=None):
         B, H, S, D = q.shape
         q = q / (D ** 0.5)
         attn_weights = torch.einsum('bhid,bhjd->bhij', q, k)  # (B, H, S, S)
         if softcap > 0.0:
             attn_weights = softcap * torch.tanh(attn_weights / softcap)
+        if attention_mask is not None:
+            if attention_mask.ndim == 2:
+                attention_mask = attention_mask[None, None, :, :]
+            elif attention_mask.ndim == 3:
+                attention_mask = attention_mask[:, None, :, :]
+            if attention_mask.dtype == torch.bool:
+                attn_weights = attn_weights.masked_fill(
+                    ~attention_mask, torch.finfo(attn_weights.dtype).min)
+            else:
+                attn_weights = attn_weights + attention_mask.to(attn_weights.dtype)
         attn_probs = torch.softmax(attn_weights, dim=-1)  # F.softmax
         output = torch.einsum('bhij,bhjd->bhid', attn_probs, v)  # (B, H, S, D)
         return output
     
-    def forward(self, x, rotary_cos_sin=None, c=None, seqlens=None, exclude_last_token=False, use_jvp_attn=False):
+    def forward(self, x, rotary_cos_sin=None, c=None, seqlens=None,
+                exclude_last_token=False, use_jvp_attn=False,
+                attention_mask=None):
 
         bias_dropout_scale_fn = self._get_bias_dropout_scale()
 
@@ -464,7 +494,14 @@ class DDiTBlock(nn.Module):
 
         if self.adaLN:
             (shift_msa, scale_msa, gate_msa, shift_mlp,
-             scale_mlp, gate_mlp) = self.adaLN_modulation(c)[:, None].chunk(6, dim=2)
+             scale_mlp, gate_mlp) = self.adaLN_modulation(c).chunk(6, dim=-1)
+            if shift_msa.ndim == 2:
+                shift_msa = shift_msa[:, None]
+                scale_msa = scale_msa[:, None]
+                gate_msa = gate_msa[:, None]
+                shift_mlp = shift_mlp[:, None]
+                scale_mlp = scale_mlp[:, None]
+                gate_mlp = gate_mlp[:, None]
             x = modulate_fused(x, shift_msa, scale_msa)
         
         qkv = self.attn_qkv(x)
@@ -476,16 +513,19 @@ class DDiTBlock(nn.Module):
         with torch.cuda.amp.autocast(enabled=False):
             cos, sin = rotary_cos_sin
             qkv = apply_rotary_pos_emb(
-                qkv, cos.to(qkv.dtype), sin.to(qkv.dtype), use_flash= not use_jvp_attn
+                qkv, cos.to(qkv.dtype), sin.to(qkv.dtype),
+                use_flash=not (use_jvp_attn or attention_mask is not None)
             )
         
-        if use_jvp_attn: #custom attention for JVP support
+        if use_jvp_attn or attention_mask is not None: #custom attention for JVP/masks
             q, k, v = qkv.unbind(dim=2) 
             q = q.transpose(1, 2)  
             k = k.transpose(1, 2)
             v = v.transpose(1, 2)
             
-            x = self.custom_sdpa(q, k, v, softcap=self.softcap)
+            x = self.custom_sdpa(
+                q, k, v, softcap=self.softcap,
+                attention_mask=attention_mask)
             x = x.transpose(1, 2)
         else:
             x = flash_attn.flash_attn_qkvpacked_func(
@@ -551,7 +591,10 @@ class DDiTFinalLayer(nn.Module):
     def forward(self, x, c):
         x = self.norm_final(x)
         if self.adaLN:
-            shift, scale = self.adaLN_modulation(c)[:, None].chunk(2, dim=2)
+            shift, scale = self.adaLN_modulation(c).chunk(2, dim=-1)
+            if shift.ndim == 2:
+                shift = shift[:, None]
+                scale = scale[:, None]
             x = modulate_fused(x, shift, scale)
         x = self.linear(x)
         return x
@@ -635,7 +678,8 @@ class DIT(nn.Module, huggingface_hub.PyTorchModelHubMixin):
             return bias_dropout_add_scale_fused_inference
     
     @torch_compile_deco
-    def forward(self, x, sigma, sigma_prime=None, use_jvp_attn=False):
+    def forward(self, x, sigma, sigma_prime=None, use_jvp_attn=False,
+                attention_mask=None, position_ids=None):
         x = self.vocab_embed(x)
             
         if self.causal:
@@ -651,13 +695,14 @@ class DIT(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                 
             t_cond = F.silu(t_emb)
 
-        rotary_cos_sin = self.rotary_emb(x)
+        rotary_cos_sin = self.rotary_emb(x, position_ids=position_ids)
         
         with torch.amp.autocast(device_type=x.device.type, dtype=torch.bfloat16):
             for i in range(len(self.blocks)):
                 x = self.blocks[i](x, rotary_cos_sin, c=t_cond,
                                     seqlens=None, exclude_last_token=self.is_di4c, 
-                                    use_jvp_attn=use_jvp_attn)
+                                    use_jvp_attn=use_jvp_attn,
+                                    attention_mask=attention_mask)
             x =  self.output_layer(x, c=t_cond)
             
         return x
