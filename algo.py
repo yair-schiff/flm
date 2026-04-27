@@ -566,8 +566,6 @@ class DUO(DUO_BASE):
                                                             low_var=False)
 
 
-
-
 class Distillation(DUO):
     def __init__(self, config, tokenizer):
         super().__init__(config, tokenizer)
@@ -781,6 +779,7 @@ class Rectification(DUO):  # Training as duo, without curriculum
                                   low_var=train_mode and self.loss_type == 'low_var',
                                   simple_loss=self.use_simple_loss,
                                   )
+
 
 class FLMBase(trainer_base.TrainerBase):
     """Base class for FLM/FMLM.
@@ -1163,6 +1162,58 @@ class FLMVDM(FLM):
                  on_epoch=not self.training,
                  sync_dist=True)
 
+    def _log_schedule_stats(self, stage, tau, tau_for_cond, gamma,
+                            alpha, sigma, vlb_weight):
+        tau = tau.detach().float()
+        tau_for_cond = tau_for_cond.detach().float()
+        gamma = gamma.detach().float()
+        alpha = alpha.detach().float()
+        sigma = sigma.detach().float()
+        vlb_weight = vlb_weight.detach().float().reshape(-1)
+
+        self._log_stage_metric(stage, 'tau_mean', tau.mean(),
+                               group='schedule')
+        self._log_stage_metric(stage, 'tau_min', tau.min(),
+                               group='schedule')
+        self._log_stage_metric(stage, 'tau_max', tau.max(),
+                               group='schedule')
+        if self.importance_sampling:
+            self._log_stage_metric(stage, 'tau_for_cond_min', tau_for_cond.min(),
+                                   group='schedule')
+            self._log_stage_metric(stage, 'tau_for_cond_max', tau_for_cond.max(),
+                                   group='schedule')
+            self._log_stage_metric(stage, 'tau_cond_mean',
+                                   tau_for_cond.mean(), group='schedule')
+        self._log_stage_metric(stage, 'gamma_mean', gamma.mean(),
+                               group='schedule')
+        self._log_stage_metric(stage, 'gamma_std',
+                               gamma.std(unbiased=False), group='schedule')
+        self._log_stage_metric(stage, 'gamma_min', gamma.min(),
+                               group='schedule')
+        self._log_stage_metric(stage, 'gamma_max', gamma.max(),
+                               group='schedule')
+        self._log_stage_metric(stage, 'alpha_mean', alpha.mean(),
+                               group='schedule')
+        self._log_stage_metric(stage, 'sigma_mean', sigma.mean(),
+                               group='schedule')
+        self._log_stage_metric(stage, 'vlb_weight_mean',
+                               vlb_weight.mean(), group='schedule')
+        self._log_stage_metric(stage, 'vlb_weight_std',
+                               vlb_weight.std(unbiased=False),
+                               group='schedule')
+        self._log_stage_metric(stage, 'vlb_weight_max',
+                               vlb_weight.max(), group='schedule')
+
+        schedule_params = [
+            p.detach().float().norm().square()
+            for p in self.noise_schedule.parameters()
+            if p.requires_grad
+        ]
+        if schedule_params:
+            param_norm = torch.stack(schedule_params).sum().sqrt()
+            self._log_stage_metric(stage, 'param_norm', param_norm,
+                                   group='schedule')
+
     def _get_noise_conditioning(self, tau, alpha, gamma):
         if self.cond_t == 'tau':
             return tau
@@ -1198,6 +1249,21 @@ class FLMVDM(FLM):
                                group='objective')
         return loss
 
+    def _log_prediction_stats(self, stage, target_tokens, log_softmax_pred):
+        with torch.no_grad():
+            pred_tokens = log_softmax_pred.argmax(dim=-1)
+            token_accuracy = (pred_tokens == target_tokens).float().mean()
+            true_token_prob = log_softmax_pred.gather(
+                dim=-1, index=target_tokens.unsqueeze(-1)).squeeze(-1).exp()
+
+            self._log_stage_metric(stage, 'token_accuracy',
+                                   token_accuracy, group='prediction')
+            self._log_stage_metric(stage, 'true_token_prob_mean',
+                                   true_token_prob.mean(), group='prediction')
+            self._log_stage_metric(stage, 'true_token_prob_median',
+                                   true_token_prob.median(),
+                                   group='prediction')
+
     def _unit_interval_from_tau(self, tau):
         width = max(self._t_max - self._t_min, 1e-12)
         return ((tau - self._t_min) / width).clamp(0.0, 1.0)
@@ -1229,6 +1295,79 @@ class FLMVDM(FLM):
             self.val_t_min, self.val_t_max, num_steps + 1, device=device)
         gamma_vals = self.noise_schedule.gamma(tau_vals)
         return tau_vals, gamma_vals
+
+    @torch.no_grad()
+    def _schedule_grid_metrics(self, n=128):
+        tau = torch.linspace(self.val_t_min, self.val_t_max, int(n),
+                             device=self.device)
+        gamma, snr_prime = self.noise_schedule(tau)
+        alpha, sigma = self._alpha_sigma_from_gamma(gamma)
+        log_snr = -gamma
+        snr = torch.exp(log_snr)
+        log_snr_prime = torch.log(snr_prime.float().clamp_min(1e-30))
+        tau_mid = 0.5 * (tau[1:] + tau[:-1])
+        slope = -torch.diff(gamma) / torch.diff(tau).clamp_min(1e-12)
+        return {
+            'tau': tau.detach(),
+            'gamma': gamma.detach(),
+            'log_snr': log_snr.detach(),
+            'snr': snr.detach(),
+            'alpha': alpha.detach(),
+            'sigma': sigma.detach(),
+            'snr_prime': snr_prime.detach(),
+            'log_snr_prime': log_snr_prime.detach(),
+            'tau_mid': tau_mid.detach(),
+            'slope': slope.detach(),
+        }
+
+    def _wandb_experiment(self):
+        if getattr(getattr(self, 'trainer', None), 'global_rank', 0) != 0:
+            return None
+        logger = getattr(self, 'logger', None)
+        experiment = getattr(logger, 'experiment', None)
+        if experiment is None or not hasattr(experiment, 'log'):
+            return None
+        return experiment
+
+    def _log_schedule_curves(self, stage='val'):
+        experiment = self._wandb_experiment()
+        if experiment is None:
+            return
+
+        metrics = self._schedule_grid_metrics(n=128)
+        columns = [
+            'tau', 'gamma', 'log_snr', 'snr', 'alpha', 'sigma',
+            'snr_prime', 'log_snr_prime']
+        curve_data = [
+            [float(metrics[column][i].detach().cpu()) for column in columns]
+            for i in range(metrics['tau'].numel())
+        ]
+        curve_table = wandb.Table(columns=columns, data=curve_data)
+
+        slope_table = wandb.Table(
+            columns=['tau', 'slope'],
+            data=[
+                [float(metrics['tau_mid'][i].detach().cpu()),
+                 float(metrics['slope'][i].detach().cpu())]
+                for i in range(metrics['tau_mid'].numel())
+            ])
+
+        prefix = f'{stage}_schedule'
+        experiment.log({
+            f'{prefix}/gamma_curve': wandb.plot.line(
+                curve_table, 'tau', 'gamma', title=f'{prefix}/gamma'),
+            f'{prefix}/log_snr_curve': wandb.plot.line(
+                curve_table, 'tau', 'log_snr', title=f'{prefix}/log_snr'),
+            f'{prefix}/alpha_curve': wandb.plot.line(
+                curve_table, 'tau', 'alpha', title=f'{prefix}/alpha'),
+            f'{prefix}/sigma_curve': wandb.plot.line(
+                curve_table, 'tau', 'sigma', title=f'{prefix}/sigma'),
+            f'{prefix}/log_snr_prime_curve': wandb.plot.line(
+                curve_table, 'tau', 'log_snr_prime',
+                title=f'{prefix}/log_snr_prime'),
+            f'{prefix}/slope_curve': wandb.plot.line(
+                slope_table, 'tau', 'slope', title=f'{prefix}/slope'),
+        }, step=int(self.global_step))
     
     def corrupt_continuous(self, x0, alpha, sigma):
         alpha = alpha.unsqueeze(-1).unsqueeze(-1)
@@ -1248,9 +1387,12 @@ class FLMVDM(FLM):
                                     t_min=self._t_min, t_max=self._t_max)
         alpha, sigma, gamma, vlb_weight, tau_for_cond = (
             self._noise_variables(tau_t))
+        self._log_schedule_stats(stage, tau_t, tau_for_cond, gamma,
+                                 alpha, sigma, vlb_weight)
         x_t, target_data = self.corrupt_continuous(x0, alpha, sigma)
         cond_t = self._get_noise_conditioning(tau_for_cond, alpha, gamma)
         f = self.forward(x_t, cond_t)
+        self._log_prediction_stats(stage, x0, f)
 
         if self.train_loss == 'ce':
             with torch.no_grad():
@@ -1313,6 +1455,10 @@ class FLMVDM(FLM):
         alpha_end, _ = self._alpha_sigma_from_gamma(gamma_end)
         cond_end = self._get_noise_conditioning(tau_end, alpha_end, gamma_end)
         return self.forward(z, cond_end).argmax(dim=-1)
+
+    def on_validation_epoch_end(self):
+        self._log_schedule_curves(stage='val')
+        return super().on_validation_epoch_end()
 
     
 class FMLM(FLMBase):
