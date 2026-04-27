@@ -1,0 +1,38 @@
+# Clean VDM-style FLM training on one-hot token latents.
+
+name: flm_vdm
+backbone: dit  # dit / dimamba / hf_dit
+parameterization: mean
+time_conditioning: True
+T: 0
+subs_masking: False
+causal_attention: False
+ignore_bos: False
+double_temb: False
+learnable_loss_weighting: False
+
+# t_min/t_max are only used by the tau_progress schedule.
+t_min: 0.0
+t_max: 1.0
+val_t_min: ${.t_min}
+val_t_max: ${.t_max}
+
+# gamma is log NSR = log(sigma^2 / alpha^2). Defaults match
+# LangFlow's Gumbel loc/scale with cutoff=1e-5.
+gamma_min: 2.641163255254888
+gamma_max: 14.532012496154636
+latent_type: vp  # vp, linear
+cond_t: gamma  # tau, gamma, log_nsr, nsr, log_snr, snr
+
+train_loss: ce  # ce, l2
+scheduler_loss_weight: 1.0
+
+schedule:
+  type: gumbel  # uniform_gamma, tau_progress, gumbel, learned_gumbel
+  loc: 4.723
+  scale: 0.852
+  h_inf: 7.02
+
+self_conditioning:
+  enabled: false
+  train_prob: 0.25

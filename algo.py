@@ -836,6 +836,7 @@ class FLMBase(trainer_base.TrainerBase):
         if self.ignore_bos:
             loss[:, 1:] = loss[:, 1:]
             valid_tokens[:, 1:] = valid_tokens[:, 1:]
+        self._track_tau_nll(loss.detach(), valid_tokens)
 
         nlls = (loss * valid_tokens).sum()
         num_tokens = valid_tokens.sum()
@@ -844,6 +845,9 @@ class FLMBase(trainer_base.TrainerBase):
                                  nlls=nlls,
                                  prior_loss=0.0,
                                  num_tokens=num_tokens)
+
+    def _track_tau_nll(self, loss, valid_tokens):
+        del loss, valid_tokens
 
     def loss(self, x0, output_tokens,
              current_accumulation_step=None, train_mode=False,
@@ -928,12 +932,17 @@ class FLMBase(trainer_base.TrainerBase):
             new_state_dict[new_key] = v
         return new_state_dict
 
-    def forward_no_softmax(self, xt, tau, tau_prime=None, **kwargs):
+    def forward_no_softmax(self, xt, tau, tau_prime=None, self_cond=None,
+                           **kwargs):
         tau = self._process_sigma(tau)
         if tau_prime is not None:
             tau_prime = self._process_sigma(tau_prime)
+        backbone_kwargs = dict(kwargs)
+        if self_cond is not None:
+            backbone_kwargs['self_cond'] = self_cond
         with torch.amp.autocast(device_type=self.device.type, dtype=torch.float32):
-            model_output = self.backbone(xt, tau, tau_prime, **kwargs)
+            model_output = self.backbone(xt, tau, tau_prime,
+                                         **backbone_kwargs)
         return model_output
 
     def _extract_ema_state_dict(self, model, checkpoint):
@@ -1032,6 +1041,219 @@ class FLMBase(trainer_base.TrainerBase):
 
 
 class FLM(FLMBase):
+    def __init__(self, config, tokenizer):
+        super().__init__(config, tokenizer)
+        self.track_tau_nll = bool(getattr(config.algo,
+                                          'track_tau_nll',
+                                          False))
+        self.tau_nll_bins = max(1, int(getattr(config.algo,
+                                               'tau_nll_bins',
+                                               20)))
+        self.tau_nll_top_k = max(1, int(getattr(config.algo,
+                                                'tau_nll_top_k',
+                                                8)))
+        self._last_tau_t = None
+        self._last_tau_loss = None
+        self._last_tau_weight = None
+        self._tau_nll_sums = None
+        self._tau_loss_sums = None
+        self._tau_weight_sums = None
+        self._tau_nll_tokens = None
+        self._tau_nll_examples = None
+
+    @staticmethod
+    #C=17.276323318481445, p=0.43169814348220825
+    def compute_schedule(t, p=0.43169814348220825, C=17.276323318481445, eps=1e-9):
+        t = t.clamp(min=eps, max=1 - eps)
+
+        L = -torch.log1p(-t)
+        L0 = torch.log(torch.tensor(2.0, device=t.device, dtype=t.dtype))
+
+        snr = C * (L / L0).pow(p)
+
+        sqrt_snr = torch.sqrt(snr)
+        alpha = sqrt_snr / (1.0 + sqrt_snr)
+        sigma = 1.0 - alpha
+
+        snr_prime = C * p * (L / L0).pow(p - 1.0) / ((1.0 - t) * L0)
+
+        return snr, alpha, sigma, snr_prime
+
+    def on_validation_epoch_start(self):
+        super().on_validation_epoch_start()
+        self._reset_tau_nll_stats()
+
+    def on_validation_epoch_end(self):
+        self._log_tau_nll_stats()
+        super().on_validation_epoch_end()
+
+    def _reset_tau_nll_stats(self):
+        self._last_tau_t = None
+        self._last_tau_loss = None
+        self._last_tau_weight = None
+        if not self.track_tau_nll:
+            return
+        shape = (self.tau_nll_bins,)
+        kwargs = dict(device=self.device, dtype=torch.float64)
+        self._tau_nll_sums = torch.zeros(shape, **kwargs)
+        self._tau_loss_sums = torch.zeros(shape, **kwargs)
+        self._tau_weight_sums = torch.zeros(shape, **kwargs)
+        self._tau_nll_tokens = torch.zeros(shape, **kwargs)
+        self._tau_nll_examples = torch.zeros(shape, **kwargs)
+
+    def _track_tau_nll(self, loss, valid_tokens):
+        if (not self.track_tau_nll
+                or self.training
+                or self._last_tau_t is None
+                or self._last_tau_loss is None
+                or self._last_tau_weight is None):
+            return
+        if self._tau_nll_sums is None:
+            self._reset_tau_nll_stats()
+
+        with torch.no_grad():
+            valid = valid_tokens.detach().to(dtype=torch.float64,
+                                             device=loss.device)
+            loss = loss.detach().to(dtype=torch.float64)
+            tau_t = self._last_tau_t.detach().to(device=loss.device)
+            base_loss = self._last_tau_loss.detach().to(dtype=torch.float64,
+                                                        device=loss.device)
+            weight = self._last_tau_weight.detach().to(dtype=torch.float64,
+                                                       device=loss.device)
+            tau_min = float(self.t_min)
+            tau_max = float(self.t_max)
+            tau_width = max(tau_max - tau_min, 1e-12)
+            bin_ids = torch.floor(
+                (tau_t - tau_min) / tau_width * self.tau_nll_bins
+            ).long().clamp_(0, self.tau_nll_bins - 1)
+
+            per_sample_nll = (loss * valid).sum(dim=1)
+            per_sample_loss = (base_loss * valid).sum(dim=1)
+            per_sample_tokens = valid.sum(dim=1)
+            per_sample_weight = weight * per_sample_tokens
+            examples = torch.ones_like(per_sample_tokens)
+
+            self._tau_nll_sums.scatter_add_(0, bin_ids,
+                                            per_sample_nll)
+            self._tau_loss_sums.scatter_add_(0, bin_ids,
+                                             per_sample_loss)
+            self._tau_weight_sums.scatter_add_(0, bin_ids,
+                                               per_sample_weight)
+            self._tau_nll_tokens.scatter_add_(0, bin_ids,
+                                              per_sample_tokens)
+            self._tau_nll_examples.scatter_add_(0, bin_ids, examples)
+            self._last_tau_t = None
+            self._last_tau_loss = None
+            self._last_tau_weight = None
+
+    def _sync_tau_nll_stats(self):
+        if (not torch.distributed.is_available()
+                or not torch.distributed.is_initialized()):
+            return
+        for value in (self._tau_nll_sums,
+                      self._tau_loss_sums,
+                      self._tau_weight_sums,
+                      self._tau_nll_tokens,
+                      self._tau_nll_examples):
+            torch.distributed.all_reduce(
+                value, op=torch.distributed.ReduceOp.SUM)
+
+    def _log_tau_nll_stats(self):
+        if not self.track_tau_nll or self._tau_nll_sums is None:
+            return
+        self._sync_tau_nll_stats()
+        total_nll = self._tau_nll_sums.sum().clamp_min(1e-12)
+        total_loss = self._tau_loss_sums.sum().clamp_min(1e-12)
+        total_tokens = self._tau_nll_tokens.sum().clamp_min(1.0)
+        bin_nll = self._tau_nll_sums / self._tau_nll_tokens.clamp_min(1.0)
+        bin_loss = self._tau_loss_sums / self._tau_nll_tokens.clamp_min(1.0)
+        bin_weight = (
+            self._tau_weight_sums / self._tau_nll_tokens.clamp_min(1.0))
+        bin_effective_weight = (
+            self._tau_nll_sums / self._tau_loss_sums.clamp_min(1e-12))
+        bin_share = self._tau_nll_sums / total_nll
+        loss_share = self._tau_loss_sums / total_loss
+        token_share = self._tau_nll_tokens / total_tokens
+        edges = torch.linspace(float(self.t_min), float(self.t_max),
+                               self.tau_nll_bins + 1,
+                               device=self.device,
+                               dtype=torch.float64)
+        _, alpha_edges, _, weight_edges = self.compute_schedule(edges)
+
+        for idx in range(self.tau_nll_bins):
+            suffix = f'bin_{idx:02d}'
+            self.log(f'val/tau_nll/{suffix}', bin_nll[idx],
+                     on_step=False, on_epoch=True, sync_dist=False)
+            self.log(f'val/tau_loss/{suffix}', bin_loss[idx],
+                     on_step=False, on_epoch=True, sync_dist=False)
+            self.log(f'val/tau_weight/{suffix}', bin_weight[idx],
+                     on_step=False, on_epoch=True, sync_dist=False)
+            self.log(f'val/tau_effective_weight/{suffix}',
+                     bin_effective_weight[idx],
+                     on_step=False, on_epoch=True, sync_dist=False)
+            self.log(f'val/tau_nll_share/{suffix}', bin_share[idx],
+                     on_step=False, on_epoch=True, sync_dist=False)
+            self.log(f'val/tau_loss_share/{suffix}', loss_share[idx],
+                     on_step=False, on_epoch=True, sync_dist=False)
+            self.log(f'val/tau_token_share/{suffix}', token_share[idx],
+                     on_step=False, on_epoch=True, sync_dist=False)
+            self.log(f'val/tau_left/{suffix}', edges[idx],
+                     on_step=False, on_epoch=True, sync_dist=False)
+            self.log(f'val/tau_right/{suffix}', edges[idx + 1],
+                     on_step=False, on_epoch=True, sync_dist=False)
+            self.log(f'val/alpha_left/{suffix}', alpha_edges[idx],
+                     on_step=False, on_epoch=True, sync_dist=False)
+            self.log(f'val/alpha_right/{suffix}', alpha_edges[idx + 1],
+                     on_step=False, on_epoch=True, sync_dist=False)
+            self.log(f'val/schedule_weight_left/{suffix}',
+                     0.5 * weight_edges[idx],
+                     on_step=False, on_epoch=True, sync_dist=False)
+            self.log(f'val/schedule_weight_right/{suffix}',
+                     0.5 * weight_edges[idx + 1],
+                     on_step=False, on_epoch=True, sync_dist=False)
+
+        if getattr(self.trainer, 'global_rank', 0) != 0:
+            return
+        print('[tau_nll] validation tau-bin summary')
+        print('[tau_nll] nll = loss * schedule_weight, '
+              'where schedule_weight = 0.5 * snr_prime')
+        for idx in range(self.tau_nll_bins):
+            print(
+                f'[tau_nll] bin {idx:02d}: '
+                f'tau=[{edges[idx].item():.4f}, '
+                f'{edges[idx + 1].item():.4f}) '
+                f'alpha=[{alpha_edges[idx].item():.4f}, '
+                f'{alpha_edges[idx + 1].item():.4f}) '
+                f'nll={bin_nll[idx].item():.6f} '
+                f'loss={bin_loss[idx].item():.6f} '
+                f'weight_mean={bin_weight[idx].item():.6f} '
+                f'eff_weight={bin_effective_weight[idx].item():.6f} '
+                f'nll_share={bin_share[idx].item():.4f} '
+                f'loss_share={loss_share[idx].item():.4f} '
+                f'token_share={token_share[idx].item():.4f} '
+                f'examples={self._tau_nll_examples[idx].item():.0f}'
+            )
+        top_k = min(self.tau_nll_top_k, self.tau_nll_bins)
+        top_bins = torch.argsort(self._tau_nll_sums,
+                                 descending=True)[:top_k]
+        print('[tau_nll] top validation tau bins by NLL mass')
+        for rank, idx_tensor in enumerate(top_bins, start=1):
+            idx = int(idx_tensor.item())
+            print(
+                f'[tau_nll] #{rank}: '
+                f'tau=[{edges[idx].item():.4f}, '
+                f'{edges[idx + 1].item():.4f}) '
+                f'alpha=[{alpha_edges[idx].item():.4f}, '
+                f'{alpha_edges[idx + 1].item():.4f}) '
+                f'nll={bin_nll[idx].item():.6f} '
+                f'loss={bin_loss[idx].item():.6f} '
+                f'eff_weight={bin_effective_weight[idx].item():.6f} '
+                f'nll_share={bin_share[idx].item():.4f} '
+                f'loss_share={loss_share[idx].item():.4f} '
+                f'token_share={token_share[idx].item():.4f} '
+                f'examples={self._tau_nll_examples[idx].item():.0f}'
+            )
+
     def loss(self, x0, output_tokens,
              current_accumulation_step=None, train_mode=False,
              xT=None, given_t=None, not_sampling_t=False):
@@ -1039,17 +1261,26 @@ class FLM(FLMBase):
         B = x0.shape[0]
         tau_t = self._sample_t_interval(B, current_accumulation_step,
                                     t_min=self.t_min, t_max=self.t_max)
-        t = self._tau_to_t(tau_t)
-        x_t, target_data = self.corrupt_continuous(x0, t)
+        self._last_tau_t = tau_t.detach()
+        # t = self._tau_to_t(tau_t)
+        # x_t, target_data = self.corrupt_continuous(x0, t)
+        snr, alpha, sigma, snr_prime = self.compute_schedule(tau_t)
+        x_t, target_data = self.corrupt_continuous(x0, alpha)
         f = self.forward(x_t, tau_t) #condition on tau_t
-        loss = -(target_data * f).sum(dim=-1)
+        # loss = -(target_data * f).sum(dim=-1)
+        loss = ((target_data - f.exp())**2).sum(dim=-1)
         self.log('loss', loss.mean(), prog_bar=True)
         if self.config.algo.learnable_loss_weighting is True:
             loss_weight = self.backbone.learnable_loss_weighting(tau_t)
             loss_weight = loss_weight.unsqueeze(-1)
             loss = torch.exp(-loss_weight) * loss + loss_weight
             self.log('loss_weighted', loss.mean(), prog_bar=True)
-        return loss
+        schedule_weight = 0.5 * snr_prime
+        # schedule_weight = snr_prime
+        self._last_tau_loss = loss.detach()
+        self._last_tau_weight = schedule_weight.detach()
+        return schedule_weight[:, None] * loss
+        # return loss
 
     @torch.no_grad()
     def generate_samples(self, num_samples, num_steps=None, eps=1e-5):
@@ -1081,7 +1312,453 @@ class FLM(FLMBase):
             z = z + dt.view(-1, 1, 1) * v
 
         return z.argmax(dim=-1)
-    
+
+
+class FLMVDM(FLM):
+    def __init__(self, config, tokenizer):
+        super().__init__(config, tokenizer)
+        self.train_t_min = float(self.t_min)
+        self.train_t_max = float(self.t_max)
+        self.val_t_min = float(getattr(config.algo, 'val_t_min',
+                                       self.train_t_min))
+        self.val_t_max = float(getattr(config.algo, 'val_t_max',
+                                       self.train_t_max))
+        self.latent_type = getattr(config.algo, 'latent_type', 'vp')
+        self.cond_t = getattr(config.algo, 'cond_t', 'gamma')
+        self.gamma_min = float(getattr(config.algo, 'gamma_min', -5.0))
+        self.gamma_max = float(getattr(config.algo, 'gamma_max', 5.0))
+        self.train_loss = getattr(config.algo, 'train_loss', 'ce')
+        self.scheduler_loss_weight = float(
+            getattr(config.algo, 'scheduler_loss_weight', 1.0))
+
+        schedule_cfg = getattr(config.algo, 'schedule', None)
+        self.schedule_cfg = schedule_cfg
+        self.schedule_type = self._schedule_get('type', 'gumbel')
+        self.gumbel_loc = float(self._schedule_get(
+            'loc', getattr(config.algo, 'gamma_proposal_loc', 0.0)))
+        self.gumbel_scale = float(self._schedule_get(
+            'scale', getattr(config.algo, 'gamma_proposal_scale', 1.0)))
+        self.learned_gumbel_h_inf_init = float(self._schedule_get(
+            'h_inf', math.log(self.vocab_size)))
+
+        self.self_conditioning_cfg = getattr(config.algo,
+                                             'self_conditioning', None)
+        self.self_conditioning_enabled = bool(getattr(
+            self.self_conditioning_cfg, 'enabled', False))
+        self.self_conditioning_train_prob = float(getattr(
+            self.self_conditioning_cfg, 'train_prob', 0.25))
+
+        self._validate_vdm_config()
+        if self.schedule_type == 'learned_gumbel':
+            self.learned_gumbel_loc = torch.nn.Parameter(
+                torch.tensor(self.gumbel_loc, dtype=torch.float32))
+            self.learned_gumbel_log_scale = torch.nn.Parameter(
+                self._inverse_softplus_tensor(self.gumbel_scale))
+            self.learned_gumbel_log_h_inf = torch.nn.Parameter(
+                self._inverse_softplus_tensor(self.learned_gumbel_h_inf_init))
+
+        self.lut_tau2gamma = None
+        self.lut_gamma2tau = None
+        if self.schedule_type == 'tau_progress':
+            self.lut_tau2gamma, self.lut_gamma2tau = utils.build_vp_luts(
+                K=self.vocab_size,
+                gamma_min=self.gamma_min,
+                gamma_max=self.gamma_max,
+            )
+
+    @staticmethod
+    def _inverse_softplus_tensor(value):
+        value = float(value)
+        if value <= 0:
+            raise ValueError("softplus inverse requires a positive value")
+        if value > 20:
+            return torch.tensor(value, dtype=torch.float32)
+        return torch.log(torch.expm1(torch.tensor(value, dtype=torch.float32)))
+
+    def _schedule_get(self, name, default):
+        if self.schedule_cfg is not None and hasattr(self.schedule_cfg, name):
+            return getattr(self.schedule_cfg, name)
+        return default
+
+    def _validate_vdm_config(self):
+        if self.latent_type not in {'vp', 'linear'}:
+            raise ValueError(
+                "algo.latent_type must be one of {'vp', 'linear'}, "
+                f"got {self.latent_type}")
+        if self.cond_t not in {
+                'tau', 'gamma', 'log_nsr', 'nsr', 'log_snr', 'snr'}:
+            raise ValueError(f"Unknown algo.cond_t: {self.cond_t}")
+        if self.schedule_type not in {
+                'uniform_gamma', 'tau_progress', 'gumbel',
+                'learned_gumbel'}:
+            raise ValueError(
+                "algo.schedule.type must be one of "
+                "{'uniform_gamma', 'tau_progress', 'gumbel', "
+                "'learned_gumbel'}, got "
+                f"{self.schedule_type}")
+        if self.train_loss not in {'ce', 'l2'}:
+            raise ValueError(
+                "algo.train_loss must be one of {'ce', 'l2'}, "
+                f"got {self.train_loss}")
+        if self.gamma_min >= self.gamma_max:
+            raise ValueError("algo.gamma_min must be smaller than "
+                             "algo.gamma_max")
+        if self.gumbel_scale <= 0:
+            raise ValueError("Gumbel schedule scale must be positive")
+        if not 0.0 <= self.self_conditioning_train_prob <= 1.0:
+            raise ValueError(
+                "self_conditioning.train_prob must be in [0, 1], "
+                f"got {self.self_conditioning_train_prob}")
+        if (self.self_conditioning_enabled
+                and self.config.algo.backbone != 'dit'):
+            raise NotImplementedError(
+                "FLMVDM self-conditioning is only implemented for DiT, "
+                f"got {self.config.algo.backbone}")
+
+    def _get_parameters(self):
+        params = list(super()._get_parameters())
+        if hasattr(self, 'learned_gumbel_loc'):
+            params.extend([
+                self.learned_gumbel_loc,
+                self.learned_gumbel_log_scale,
+                self.learned_gumbel_log_h_inf,
+            ])
+        return params
+
+    def _tau_to_gamma(self, tau):
+        return utils.tau_to_gamma(tau, self.lut_tau2gamma)
+
+    def _d_gamma_by_d_tau(self, tau):
+        return utils.d_tau_to_gamma(tau, self.lut_tau2gamma)
+
+    def _gamma_support(self, device, dtype):
+        return (
+            torch.tensor(self.gamma_min, device=device, dtype=dtype),
+            torch.tensor(self.gamma_max, device=device, dtype=dtype),
+        )
+
+    def _gamma_to_unit_tau(self, gamma):
+        width = max(self.gamma_max - self.gamma_min, 1e-12)
+        return ((self.gamma_max - gamma) / width).clamp(0.0, 1.0)
+
+    def _alpha_sigma(self, gamma):
+        return utils.vdm_alpha_sigma_from_gamma(gamma, self.latent_type)
+
+    def _get_noise_conditioning(self, tau, gamma):
+        if self.cond_t == 'tau':
+            return tau
+        if self.cond_t in {'gamma', 'log_nsr'}:
+            return gamma
+        if self.cond_t == 'nsr':
+            return torch.exp(gamma)
+        if self.cond_t == 'log_snr':
+            return -gamma
+        if self.cond_t == 'snr':
+            return torch.exp(-gamma)
+        raise ValueError(f"Unknown cond_t: {self.cond_t}")
+
+    def _current_gumbel_params(self, detach=False):
+        if hasattr(self, 'learned_gumbel_loc'):
+            loc = self.learned_gumbel_loc
+            scale = F.softplus(self.learned_gumbel_log_scale).clamp_min(1e-6)
+            h_inf = F.softplus(self.learned_gumbel_log_h_inf).clamp_min(1e-6)
+        else:
+            device = self.device
+            loc = torch.tensor(self.gumbel_loc, device=device,
+                               dtype=torch.float32)
+            scale = torch.tensor(self.gumbel_scale, device=device,
+                                 dtype=torch.float32)
+            h_inf = torch.tensor(self.learned_gumbel_h_inf_init,
+                                 device=device, dtype=torch.float32)
+        if detach:
+            return loc.detach(), scale.detach(), h_inf.detach()
+        return loc, scale, h_inf
+
+    def _gumbel_cdf(self, gamma, loc, scale):
+        z = (gamma - loc) / scale
+        return torch.exp(-torch.exp(-z))
+
+    def _truncated_gumbel_pdf(self, gamma, loc, scale,
+                              gamma_min, gamma_max):
+        z = (gamma - loc) / scale
+        pdf = torch.exp(-(z + torch.exp(-z))) / scale
+        cdf_min = self._gumbel_cdf(gamma_min, loc, scale)
+        cdf_max = self._gumbel_cdf(gamma_max, loc, scale)
+        return pdf / (cdf_max - cdf_min).clamp_min(1e-12)
+
+    def _sample_truncated_gumbel_gamma(self, unit, loc, scale):
+        dtype = unit.dtype
+        device = unit.device
+        work_unit = unit.double()
+        gamma_min, gamma_max = self._gamma_support(device, torch.float64)
+        loc = loc.to(device=device, dtype=torch.float64)
+        scale = scale.to(device=device, dtype=torch.float64)
+        cdf_min = self._gumbel_cdf(gamma_min, loc, scale)
+        cdf_max = self._gumbel_cdf(gamma_max, loc, scale)
+        u = cdf_min + work_unit * (cdf_max - cdf_min)
+        u = u.clamp(1e-12, 1.0 - 1e-7)
+        gamma = loc - scale * torch.log(-torch.log(u))
+        return gamma.to(dtype=dtype)
+
+    def _sample_schedule(self, batch_size, accum_step):
+        unit = self._sample_t_interval(batch_size, accum_step,
+                                       t_min=0.0, t_max=1.0)
+        device = unit.device
+        dtype = unit.dtype
+        gamma_min, gamma_max = self._gamma_support(device, dtype)
+        width = (gamma_max - gamma_min).clamp_min(1e-12)
+
+        diagnostics = {'unit': unit}
+        if self.schedule_type == 'uniform_gamma':
+            gamma = gamma_min + unit * width
+            tau = self._gamma_to_unit_tau(gamma)
+            proposal_density = torch.ones_like(gamma) / width
+            elbo_weight = torch.exp(-gamma) / proposal_density
+        elif self.schedule_type == 'tau_progress':
+            t_min, t_max = (
+                (self.train_t_min, self.train_t_max)
+                if self.training else (self.val_t_min, self.val_t_max))
+            tau = self._sample_t_interval(batch_size, accum_step,
+                                          t_min=t_min, t_max=t_max)
+            gamma = self._tau_to_gamma(tau)
+            dgamma_dtau = self._d_gamma_by_d_tau(tau)
+            tau_width = torch.tensor(
+                max(t_max - t_min, 1e-12), device=device, dtype=dtype)
+            neg_dgamma_dtau = (-dgamma_dtau).clamp_min(1e-12)
+            proposal_density = 1.0 / (tau_width * neg_dgamma_dtau)
+            elbo_weight = torch.exp(-gamma) / proposal_density
+            diagnostics['dgamma_dtau'] = dgamma_dtau
+        elif self.schedule_type in {'gumbel', 'learned_gumbel'}:
+            loc, scale, _ = self._current_gumbel_params(detach=True)
+            gamma = self._sample_truncated_gumbel_gamma(unit, loc, scale)
+            tau = self._gamma_to_unit_tau(gamma)
+            proposal_density = self._truncated_gumbel_pdf(
+                gamma,
+                loc.to(device=device, dtype=dtype),
+                scale.to(device=device, dtype=dtype),
+                gamma_min,
+                gamma_max,
+            )
+            elbo_weight = torch.exp(-gamma) / proposal_density.clamp_min(
+                1e-12)
+        else:
+            raise ValueError(f"Unknown schedule_type: {self.schedule_type}")
+
+        diagnostics.update({
+            'gamma': gamma,
+            'tau': tau,
+            'proposal_density': proposal_density,
+            'elbo_weight': elbo_weight,
+            'snr': torch.exp(-gamma),
+        })
+        return gamma, tau, elbo_weight, diagnostics
+
+    def _build_self_conditioning(self, x_t, cond_t, mask=None):
+        if not self.self_conditioning_enabled:
+            return None
+        if mask is None:
+            with torch.no_grad():
+                return self.forward(x_t, cond_t).detach().exp().to(x_t.dtype)
+        self_cond = torch.zeros_like(x_t)
+        if not mask.any():
+            return self_cond
+        with torch.no_grad():
+            self_cond[mask] = self.forward(
+                x_t[mask], cond_t[mask]).detach().exp().to(self_cond.dtype)
+        return self_cond
+
+    def _learned_scheduler_loss(self, gamma, ce_loss):
+        if self.schedule_type != 'learned_gumbel' or not self.training:
+            return gamma.new_tensor(0.0)
+        loc, scale, h_inf = self._current_gumbel_params(detach=False)
+        cdf = self._gumbel_cdf(gamma.detach(), loc.to(gamma.device),
+                               scale.to(gamma.device))
+        ce_per_sample = ce_loss.detach().mean(dim=-1)
+        entropy_fit = h_inf.to(gamma.device) * cdf
+        return F.mse_loss(entropy_fit, ce_per_sample)
+
+    def _masked_mean(self, values, valid_tokens):
+        valid = valid_tokens.to(values.dtype)
+        return (values * valid).sum() / valid.sum().clamp_min(1.0)
+
+    def _log_metric(self, stage, name, value, prog_bar=False):
+        self.log(f'{stage}/{name}',
+                 value.detach() if torch.is_tensor(value) else value,
+                 on_step=self.training,
+                 on_epoch=not self.training,
+                 prog_bar=prog_bar,
+                 sync_dist=True)
+
+    def _log_vdm_metrics(self, stage, valid_tokens, ce_loss, l2_loss,
+                         nll_upper_kl, nll_upper_l2, diagnostics,
+                         scheduler_loss):
+        ce_unweighted = self._masked_mean(ce_loss, valid_tokens)
+        l2_unweighted = self._masked_mean(l2_loss, valid_tokens)
+        nll_kl = self._masked_mean(nll_upper_kl, valid_tokens)
+        nll_l2 = self._masked_mean(nll_upper_l2, valid_tokens)
+        self._log_metric(stage, 'ce_unweighted', ce_unweighted)
+        self._log_metric(stage, 'l2_unweighted', l2_unweighted)
+        self._log_metric(stage, 'nll_upper_kl', nll_kl, prog_bar=True)
+        self._log_metric(stage, 'nll_upper_l2', nll_l2)
+        self._log_metric(stage, 'scheduler_loss', scheduler_loss)
+
+        for name in ('gamma', 'tau', 'snr', 'proposal_density',
+                     'elbo_weight'):
+            values = diagnostics[name].detach().float()
+            self._log_metric(stage, f'{name}_mean', values.mean())
+            self._log_metric(stage, f'{name}_max', values.max())
+        if 'dgamma_dtau' in diagnostics:
+            values = diagnostics['dgamma_dtau'].detach().float()
+            self._log_metric(stage, 'dgamma_dtau_mean', values.mean())
+
+        if hasattr(self, 'learned_gumbel_loc'):
+            loc, scale, h_inf = self._current_gumbel_params(detach=True)
+            self._log_metric(stage, 'gumbel_loc', loc)
+            self._log_metric(stage, 'gumbel_scale', scale)
+            self._log_metric(stage, 'gumbel_h_inf', h_inf)
+
+    def _compute_vdm_terms(self, x0, valid_tokens, accum_step):
+        batch_size = x0.shape[0]
+        stage = 'train' if self.training else 'val'
+        gamma, tau, elbo_weight, diagnostics = self._sample_schedule(
+            batch_size, accum_step)
+
+        target_data = F.one_hot(x0, self.vocab_size).float()
+        noise = torch.randn_like(target_data, dtype=torch.float32)
+        alpha, sigma = self._alpha_sigma(gamma)
+        x_t = (alpha.view(-1, 1, 1) * target_data
+               + sigma.view(-1, 1, 1) * noise)
+        cond_t = self._get_noise_conditioning(tau, gamma)
+
+        self_cond = None
+        if self.self_conditioning_enabled:
+            if self.training:
+                mask = (
+                    torch.rand(batch_size, device=self.device)
+                    < self.self_conditioning_train_prob)
+                self_cond = self._build_self_conditioning(
+                    x_t, cond_t, mask=mask)
+                self._log_metric(stage, 'selfcond_frac',
+                                 mask.float().mean())
+            else:
+                self_cond = self._build_self_conditioning(x_t, cond_t)
+                self._log_metric(stage, 'selfcond_frac',
+                                 x_t.new_tensor(1.0))
+        else:
+            self._log_metric(stage, 'selfcond_frac', x_t.new_tensor(0.0))
+
+        log_probs = self.forward(x_t, cond_t, self_cond=self_cond)
+        probs = log_probs.exp()
+        ce_loss = -(target_data * log_probs).sum(dim=-1)
+        l2_loss = ((target_data - probs) ** 2).sum(dim=-1)
+        weight = elbo_weight.view(-1, 1)
+        nll_upper_kl = ce_loss * weight
+        nll_upper_l2 = 0.5 * l2_loss * weight
+        scheduler_loss = self._learned_scheduler_loss(gamma, ce_loss)
+
+        self._log_vdm_metrics(stage, valid_tokens, ce_loss, l2_loss,
+                              nll_upper_kl, nll_upper_l2, diagnostics,
+                              scheduler_loss)
+        selected = nll_upper_kl if self.train_loss == 'ce' else nll_upper_l2
+        return selected, nll_upper_kl, nll_upper_l2, scheduler_loss
+
+    def _loss(self, x0, valid_tokens,
+              current_accumulation_step=None,
+              train_mode=False,
+              xT=None, given_t=None, not_sampling_t=False):
+        del train_mode, xT, given_t, not_sampling_t
+        input_tokens, _, valid_tokens = self._process_model_input(
+            x0, valid_tokens)
+        valid_tokens = valid_tokens.clone()
+        if self.ignore_bos:
+            valid_tokens[:, 0] = 0
+        selected, nll_upper_kl, _, scheduler_loss = self._compute_vdm_terms(
+            input_tokens, valid_tokens, current_accumulation_step)
+
+        valid = valid_tokens.to(selected.dtype)
+        num_tokens = valid.sum().clamp_min(1.0)
+        objective = (selected * valid).sum() / num_tokens
+        if self.training and self.schedule_type == 'learned_gumbel':
+            objective = objective + self.scheduler_loss_weight * scheduler_loss
+        nlls = (nll_upper_kl * valid).sum()
+        self.log('loss', objective.detach(), prog_bar=True, sync_dist=True)
+        return trainer_base.Loss(loss=objective,
+                                 nlls=nlls,
+                                 prior_loss=0.0,
+                                 num_tokens=num_tokens)
+
+    def loss(self, x0, output_tokens,
+             current_accumulation_step=None, train_mode=False,
+             xT=None, given_t=None, not_sampling_t=False):
+        del output_tokens, train_mode, xT, given_t, not_sampling_t
+        valid_tokens = torch.ones_like(x0, dtype=torch.float32,
+                                       device=x0.device)
+        selected, _, _, _ = self._compute_vdm_terms(
+            x0, valid_tokens, current_accumulation_step)
+        return selected
+
+    def _sampling_gamma_grid(self, num_steps, device):
+        if self.schedule_type == 'tau_progress':
+            tau_vals = torch.linspace(self.val_t_min, self.val_t_max,
+                                      num_steps + 1, device=device)
+            return self._tau_to_gamma(tau_vals), tau_vals
+        if self.schedule_type in {'gumbel', 'learned_gumbel'}:
+            loc, scale, _ = self._current_gumbel_params(detach=True)
+            units = torch.linspace(1.0, 0.0, num_steps + 1, device=device)
+            gamma_vals = self._sample_truncated_gumbel_gamma(
+                units, loc.to(device), scale.to(device))
+            return gamma_vals, self._gamma_to_unit_tau(gamma_vals)
+        gamma_vals = torch.linspace(self.gamma_max, self.gamma_min,
+                                    num_steps + 1, device=device)
+        return gamma_vals, self._gamma_to_unit_tau(gamma_vals)
+
+    @torch.no_grad()
+    def generate_samples(self, num_samples, num_steps=None, eps=1e-5):
+        del eps
+        if num_steps is None:
+            num_steps = self.config.sampling.steps
+        if num_steps < 1:
+            raise ValueError("num_steps must be >= 1")
+
+        batch_size = num_samples
+        length = self.num_tokens
+        device = self.device
+        sigma_floor = 1e-5
+
+        gamma_vals, tau_vals = self._sampling_gamma_grid(num_steps, device)
+        alpha_start, sigma_start = self._alpha_sigma(gamma_vals[0])
+        z = sigma_start * torch.randn(
+            (num_samples, length, self.vocab_size),
+            device=device,
+            dtype=self.dtype)
+        self_cond = None
+
+        for i in range(num_steps):
+            gamma_curr = gamma_vals[i].expand(batch_size)
+            tau_curr = tau_vals[i].expand(batch_size)
+            alpha_curr, sigma_curr = self._alpha_sigma(gamma_curr)
+            cond_curr = self._get_noise_conditioning(tau_curr, gamma_curr)
+
+            x_hat0 = self.forward(z, cond_curr,
+                                  self_cond=self_cond).exp()
+            if self.self_conditioning_enabled:
+                self_cond = x_hat0.detach()
+
+            eps_hat = (
+                z - alpha_curr.view(-1, 1, 1) * x_hat0
+            ) / sigma_curr.view(-1, 1, 1).clamp_min(sigma_floor)
+
+            gamma_next = gamma_vals[i + 1].expand(batch_size)
+            alpha_next, sigma_next = self._alpha_sigma(gamma_next)
+            z = (alpha_next.view(-1, 1, 1) * x_hat0
+                 + sigma_next.view(-1, 1, 1) * eps_hat)
+
+        gamma_end = gamma_vals[-1].expand(batch_size)
+        tau_end = tau_vals[-1].expand(batch_size)
+        cond_end = self._get_noise_conditioning(tau_end, gamma_end)
+        return self.forward(z, cond_end, self_cond=self_cond).argmax(dim=-1)
+
+
 class FMLM(FLMBase):
     def __init__(self, config, tokenizer):
         super().__init__(config, tokenizer)

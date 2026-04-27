@@ -602,6 +602,78 @@ def build_luts(K: int, n_points: int = 10000, is_diffusion=False) -> tuple[Cubic
     
     return lut_a2g, lut_g2a
 
+
+def vdm_alpha_sigma_from_gamma(gamma, latent_type: str = 'vp'):
+    """Return VDM corruption coefficients from logNSR gamma."""
+    if latent_type == 'vp':
+        if isinstance(gamma, torch.Tensor):
+            return torch.sigmoid(-gamma).sqrt(), torch.sigmoid(gamma).sqrt()
+        gamma = np.asarray(gamma)
+        return np.sqrt(1.0 / (1.0 + np.exp(gamma))), np.sqrt(
+            1.0 / (1.0 + np.exp(-gamma)))
+
+    if latent_type == 'linear':
+        if isinstance(gamma, torch.Tensor):
+            return torch.sigmoid(-0.5 * gamma), torch.sigmoid(0.5 * gamma)
+        gamma = np.asarray(gamma)
+        return 1.0 / (1.0 + np.exp(0.5 * gamma)), 1.0 / (
+            1.0 + np.exp(-0.5 * gamma))
+
+    raise ValueError(f"Unknown VDM latent_type: {latent_type}")
+
+
+def compute_vp_tau_exact(
+        gamma: np.ndarray,
+        K: int,
+        n_gh: int = 100,
+) -> np.ndarray:
+    """Compute standardized decoding progress tau(gamma) for logNSR paths."""
+    gamma = np.asarray(gamma, dtype=np.float64)
+
+    # For both supported latent families,
+    # alpha(gamma) / sigma(gamma) = sqrt(SNR) = exp(-gamma / 2).
+    m_c = np.exp(-0.5 * gamma)
+
+    x, w = hermgauss(n_gh)
+    w = w / np.sqrt(np.pi)
+    z_nodes = np.sqrt(2.0) * x
+
+    log_cdf = log_ndtr(z_nodes[None, :] + m_c[:, None])
+    log_prod_c = (K - 1) * log_cdf
+    q_c = np.sum(w * np.exp(log_prod_c), axis=-1)
+
+    tau = K / (K - 1.0) * (q_c - 1.0 / K)
+    tau = tau - gamma * 1e-10
+    return np.clip(tau, 0.0, 1.0)
+
+
+def build_vp_luts(
+        K: int,
+        gamma_min: float,
+        gamma_max: float,
+        n_points: int = 10000,
+) -> tuple[CubicSpline, CubicSpline]:
+    """Build tau <-> gamma lookup tables for VDM tau-progress schedules."""
+    gamma_vals = np.linspace(gamma_min, gamma_max, n_points, dtype=np.float64)
+    tau_vals = compute_vp_tau_exact(gamma_vals, K=K)
+
+    lut_gamma2tau = CubicSpline(gamma_vals, tau_vals)
+
+    sorted_indices = np.argsort(tau_vals)
+    tau_sorted = tau_vals[sorted_indices]
+    gamma_sorted = gamma_vals[sorted_indices]
+    unique_tau, unique_indices = np.unique(tau_sorted, return_index=True)
+    unique_gamma = gamma_sorted[unique_indices]
+
+    tau_augmented = np.concatenate(([0.0], unique_tau, [1.0]))
+    gamma_augmented = np.concatenate(([gamma_max], unique_gamma, [gamma_min]))
+    tau_augmented, unique_indices = np.unique(tau_augmented,
+                                              return_index=True)
+    gamma_augmented = gamma_augmented[unique_indices]
+    lut_tau2gamma = CubicSpline(tau_augmented, gamma_augmented)
+
+    return lut_tau2gamma, lut_gamma2tau
+
 # Initialize LUTs globally (lazy loading or explicit init recommended in real apps, 
 # but running here for immediate use)
 # Using a default K=50000 as per previous context.
@@ -630,6 +702,50 @@ def gamma_to_alpha(gamma: Union[np.ndarray, torch.tensor], lut: CubicSpline) -> 
         return torch.from_numpy(alpha).to(gamma.device, dtype=dtype)
     else:
         return np.clip(lut(gamma), 0.0, 1.0)
-    
-    
-    
+
+
+def d_alpha_to_gamma(alpha: Union[np.ndarray, torch.Tensor], lut: CubicSpline) -> Union[np.ndarray, torch.Tensor]:
+    """Derivative of the alpha/progress -> gamma spline map."""
+    lut_prime = lut.derivative()
+
+    if isinstance(alpha, torch.Tensor):
+        dtype = alpha.dtype
+        device = alpha.device
+        alpha_np = alpha.detach().cpu().numpy()
+        deriv = np.asarray(lut_prime(alpha_np))
+        return torch.from_numpy(deriv).to(device=device, dtype=dtype)
+    return lut_prime(alpha)
+
+
+def tau_to_gamma(tau: Union[np.ndarray, torch.Tensor], lut: CubicSpline) -> Union[np.ndarray, torch.Tensor]:
+    """Map standardized decoding progress tau -> logNSR gamma."""
+    if isinstance(tau, torch.Tensor):
+        dtype = tau.dtype
+        tau_np = np.clip(tau.detach().cpu().numpy(), 0.0, 1.0)
+        gamma = np.asarray(lut(tau_np))
+        return torch.from_numpy(gamma).to(tau.device, dtype=dtype)
+    tau = np.clip(np.asarray(tau), 0.0, 1.0)
+    return np.asarray(lut(tau))
+
+
+def gamma_to_tau(gamma: Union[np.ndarray, torch.Tensor], lut: CubicSpline) -> Union[np.ndarray, torch.Tensor]:
+    """Map logNSR gamma -> standardized decoding progress tau."""
+    if isinstance(gamma, torch.Tensor):
+        dtype = gamma.dtype
+        tau = np.clip(lut(gamma.detach().cpu().numpy()), 0.0, 1.0)
+        return torch.from_numpy(tau).to(gamma.device, dtype=dtype)
+    return np.clip(lut(gamma), 0.0, 1.0)
+
+
+def d_tau_to_gamma(tau: Union[np.ndarray, torch.Tensor], lut: CubicSpline) -> Union[np.ndarray, torch.Tensor]:
+    """Derivative of the tau -> gamma spline map."""
+    lut_prime = lut.derivative()
+
+    if isinstance(tau, torch.Tensor):
+        dtype = tau.dtype
+        device = tau.device
+        tau_np = np.clip(tau.detach().cpu().numpy(), 0.0, 1.0)
+        deriv = np.asarray(lut_prime(tau_np))
+        return torch.from_numpy(deriv).to(device=device, dtype=dtype)
+    tau = np.clip(np.asarray(tau), 0.0, 1.0)
+    return lut_prime(tau)

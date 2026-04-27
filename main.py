@@ -427,6 +427,8 @@ def main(config):
         diffusion_model = algo.DUO
     elif config.algo.name == 'flm':
         diffusion_model = algo.FLM
+    elif config.algo.name == 'flm_vdm':
+        diffusion_model = algo.FLMVDM
     elif config.algo.name == 'fmlm_twomodel':
         diffusion_model = algo.FMLM_TwoModel
     elif config.algo.name == 'fmlm_twostage':
