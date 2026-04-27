@@ -477,7 +477,7 @@ def compute_qs_fast(alpha: float, tau: float, b: float, K: int, M: int, *,
 # ----------------------------
 # Core Exact Computation (Gamma -> Alpha)
 # ----------------------------
-def compute_alpha_exact(gamma: np.ndarray, K: int, n_gh: int = 100, sigma_floor: float = 1e-12, is_diffusion=False) -> np.ndarray:
+def compute_alpha_exact(gamma: np.ndarray, K: int, n_gh: int = 100, sigma_floor: float = 1e-12) -> np.ndarray:
     """
     Computes q_c (Alpha) from Gamma using Gauss-Hermite integration.
     This is the ground-truth function mapping Gamma -> Alpha.
@@ -485,10 +485,7 @@ def compute_alpha_exact(gamma: np.ndarray, K: int, n_gh: int = 100, sigma_floor:
     gamma = np.asarray(gamma)
 
     # 1. Standardized means (assuming tau=0, b=1.0 for this conversion)
-    sigma = 1.0 - gamma
-    if is_diffusion:
-        sigma = np.sqrt(sigma)
-    sigma = np.maximum(sigma, sigma_floor)
+    sigma = np.maximum(1.0 - gamma, sigma_floor)
     
     m_c = gamma / sigma
     
@@ -519,7 +516,7 @@ def compute_alpha_exact(gamma: np.ndarray, K: int, n_gh: int = 100, sigma_floor:
 
     return alpha
 
-def compute_alpha_exact_torch(gamma, K: int, x_np, w_np, sigma_floor: float = 1e-12, is_diffusion=False, device=None) -> torch.Tensor:
+def compute_alpha_exact_torch(gamma, K: int, x_np, w_np, sigma_floor: float = 1e-12, device=None) -> torch.Tensor:
     """
     Computes q_c (Alpha) from Gamma using Gauss-Hermite integration (PyTorch version).
     """
@@ -527,11 +524,10 @@ def compute_alpha_exact_torch(gamma, K: int, x_np, w_np, sigma_floor: float = 1e
     dtype = gamma.dtype
     device = gamma.device 
 
-    sigma = 1.0 - gamma
-    if is_diffusion:
-        sigma = torch.sqrt(sigma)
-    
-    sigma = torch.maximum(sigma, torch.tensor(sigma_floor, device=device, dtype=dtype))
+    sigma = torch.maximum(
+        1.0 - gamma,
+        torch.tensor(sigma_floor, device=device, dtype=dtype),
+    )
     
     m_c = gamma / sigma
     
@@ -562,7 +558,7 @@ def compute_alpha_exact_torch(gamma, K: int, x_np, w_np, sigma_floor: float = 1e
 # LUT / Spline Implementation
 # ----------------------------
 
-def build_luts(K: int, n_points: int = 10000, is_diffusion=False) -> tuple[CubicSpline, CubicSpline]:
+def build_luts(K: int, n_points: int = 10000) -> tuple[CubicSpline, CubicSpline]:
     """
     Builds two lookup tables (Splines):
     1. Alpha -> Gamma (Forward)
@@ -578,7 +574,7 @@ def build_luts(K: int, n_points: int = 10000, is_diffusion=False) -> tuple[Cubic
     gamma_vals = np.linspace(0.0, 1.0, n_points) # cont.
     
     # 2. Compute corresponding Gamma grid (Exact)
-    alpha_vals = compute_alpha_exact(gamma_vals, K=K, is_diffusion=is_diffusion) # disc.
+    alpha_vals = compute_alpha_exact(gamma_vals, K=K) # disc.
     
     # 3. Build Forward Spline (Alpha -> Gamma)
     # Alpha is strictly increasing. Safe.
@@ -601,6 +597,61 @@ def build_luts(K: int, n_points: int = 10000, is_diffusion=False) -> tuple[Cubic
     lut_a2g = CubicSpline(unique_alpha, unique_gamma)
     
     return lut_a2g, lut_g2a
+
+
+def compute_vp_tau_exact(
+        gamma: np.ndarray,
+        K: int,
+        n_gh: int = 100,
+) -> np.ndarray:
+    """Compute standardized decoding progress tau(gamma) for VP corruption."""
+    gamma = np.asarray(gamma, dtype=np.float64)
+
+    # Under VP corruption, the correct-vs-incorrect margin in noise-standard-
+    # deviation units is alpha(gamma) / sigma(gamma) = exp(-gamma / 2).
+    m_c = np.exp(-0.5 * gamma)
+
+    x, w = hermgauss(n_gh)
+    w = w / np.sqrt(np.pi)
+    z_nodes = np.sqrt(2.0) * x
+
+    log_cdf = log_ndtr(z_nodes[None, :] + m_c[:, None])
+    log_prod_c = (K - 1) * log_cdf
+    q_c = np.sum(w * np.exp(log_prod_c), axis=-1)
+
+    tau = K / (K - 1.0) * (q_c - 1.0 / K)
+    tau = tau - gamma * 1e-10
+    return np.clip(tau, 0.0, 1.0)
+
+
+def build_vp_luts(
+        K: int,
+        gamma_min: float,
+        gamma_max: float,
+        n_points: int = 10000,
+) -> tuple[CubicSpline, CubicSpline]:
+    """Build tau <-> gamma lookup tables for VP/VDM corruption."""
+    gamma_vals = np.linspace(gamma_min, gamma_max, n_points, dtype=np.float64)
+    tau_vals = compute_vp_tau_exact(gamma_vals, K=K)
+
+    lut_gamma2tau = CubicSpline(gamma_vals, tau_vals)
+
+    sorted_indices = np.argsort(tau_vals)
+    tau_sorted = tau_vals[sorted_indices]
+    gamma_sorted = gamma_vals[sorted_indices]
+    unique_tau, unique_indices = np.unique(tau_sorted, return_index=True)
+    unique_gamma = gamma_sorted[unique_indices]
+
+    # Pin the inverse-LUT endpoints so uniform tau sampling on [0, 1] maps to
+    # the configured VP noise range instead of spline extrapolating past it.
+    tau_augmented = np.concatenate(([0.0], unique_tau, [1.0]))
+    gamma_augmented = np.concatenate(([gamma_max], unique_gamma, [gamma_min]))
+    tau_augmented, unique_indices = np.unique(tau_augmented,
+                                              return_index=True)
+    gamma_augmented = gamma_augmented[unique_indices]
+    lut_tau2gamma = CubicSpline(tau_augmented, gamma_augmented)
+
+    return lut_tau2gamma, lut_gamma2tau
 
 # Initialize LUTs globally (lazy loading or explicit init recommended in real apps, 
 # but running here for immediate use)
@@ -631,5 +682,55 @@ def gamma_to_alpha(gamma: Union[np.ndarray, torch.tensor], lut: CubicSpline) -> 
     else:
         return np.clip(lut(gamma), 0.0, 1.0)
     
-    
-    
+
+def d_alpha_to_gamma(alpha: Union[np.ndarray, torch.Tensor], lut: CubicSpline) -> Union[np.ndarray, torch.Tensor]:
+    """
+    Derivative of the Alpha -> Gamma spline map.
+    If t = alpha_to_gamma(alpha), returns dt/dalpha.
+    """
+    lut_prime = lut.derivative()
+
+    if isinstance(alpha, torch.Tensor):
+        dtype = alpha.dtype
+        device = alpha.device
+        alpha_np = alpha.detach().cpu().numpy()
+        deriv = lut_prime(alpha_np)
+        deriv = np.asarray(deriv)
+        return torch.from_numpy(deriv).to(device=device, dtype=dtype)
+    else:
+        return lut_prime(alpha)
+
+
+def tau_to_gamma(tau: Union[np.ndarray, torch.Tensor], lut: CubicSpline) -> Union[np.ndarray, torch.Tensor]:
+    """Maps standardized decoding progress tau -> VP log-SNR gamma."""
+    if isinstance(tau, torch.Tensor):
+        dtype = tau.dtype
+        tau_np = np.clip(tau.detach().cpu().numpy(), 0.0, 1.0)
+        gamma = lut(tau_np)
+        gamma = np.asarray(gamma)
+        return torch.from_numpy(gamma).to(tau.device, dtype=dtype)
+    tau = np.clip(np.asarray(tau), 0.0, 1.0)
+    return np.asarray(lut(tau))
+
+
+def gamma_to_tau(gamma: Union[np.ndarray, torch.Tensor], lut: CubicSpline) -> Union[np.ndarray, torch.Tensor]:
+    """Maps VP log-SNR gamma -> standardized decoding progress tau."""
+    if isinstance(gamma, torch.Tensor):
+        dtype = gamma.dtype
+        tau = np.clip(lut(gamma.detach().cpu().numpy()), 0.0, 1.0)
+        return torch.from_numpy(tau).to(gamma.device, dtype=dtype)
+    return np.clip(lut(gamma), 0.0, 1.0)
+
+
+def d_tau_to_gamma(tau: Union[np.ndarray, torch.Tensor], lut: CubicSpline) -> Union[np.ndarray, torch.Tensor]:
+    """Derivative of the tau -> gamma spline map, i.e. dgamma/dtau."""
+    lut_prime = lut.derivative()
+
+    if isinstance(tau, torch.Tensor):
+        dtype = tau.dtype
+        device = tau.device
+        tau_np = np.clip(tau.detach().cpu().numpy(), 0.0, 1.0)
+        deriv = np.asarray(lut_prime(tau_np))
+        return torch.from_numpy(deriv).to(device=device, dtype=dtype)
+    tau = np.clip(np.asarray(tau), 0.0, 1.0)
+    return lut_prime(tau)

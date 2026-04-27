@@ -1,0 +1,30 @@
+# for flm pretrain (only fm loss)
+
+name: flm_vdm
+backbone: dit  # dit / dimamba / hf_dit
+parameterization: mean
+time_conditioning: True
+T: 0
+subs_masking: False
+causal_attention: False
+ignore_bos: False
+interpolant_type: vp_vdm
+t_max: 1.0
+t_min: 0.0
+val_t_min: ${.t_min}
+val_t_max: ${.t_max}
+double_temb: False
+learnable_loss_weighting: False
+cond_t: tau  # tau, snr, log_snr, nsr, log_nsr
+gamma_min: -5.
+gamma_max: 5.
+noise_proposal: tau  # tau, gamma_gumbel
+train_objective: vlb  # vlb, bounded_vlb, proposal_ce
+gamma_proposal_loc: 0.0
+gamma_proposal_scale: 1.0
+vlb_proposal_floor: 0.05
+train_loss: 'ce'  # 'ce' or 'l2'
+train_on_weighted_loss: True
+self_conditioning:
+  enabled: false
+  train_prob: 0.25

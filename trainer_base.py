@@ -295,7 +295,7 @@ class TrainerBase(L.LightningModule):
                     pin_memory=self.config.loader.pin_memory,
                     sampler=dl_sampler,
                     shuffle=False,
-                    persistent_workers=True))
+                    persistent_workers=False))
         self.trainer.fit_loop._combined_loader.flattened = updated_dls
 
     def optimizer_step(self, *args, **kwargs):
@@ -310,14 +310,23 @@ class TrainerBase(L.LightningModule):
         raise NotImplementedError
 
     def forward(self, xt, sigma, sigma_prime=None, use_jvp_attn=False,
+                self_cond=None,
                 **kwargs):
 
         sigma = self._process_sigma(sigma)
         if sigma_prime is not None:
             sigma_prime = self._process_sigma(sigma_prime)
+        backbone_kwargs = {'use_jvp_attn': use_jvp_attn}
+        if self_cond is not None:
+            backbone_kwargs['self_cond'] = self_cond
         with torch.amp.autocast(device_type=self.device.type, dtype=torch.float32):
             model_output = self.backbone(
-                xt, sigma, sigma_prime, use_jvp_attn=use_jvp_attn, **kwargs)
+                
+                xt,
+                sigma,
+                sigma_prime,
+                **backbone_kwargs,
+            , **kwargs)
         
         return self._process_model_output(
             model_output=model_output, xt=xt, sigma=sigma)

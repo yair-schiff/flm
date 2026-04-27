@@ -928,12 +928,17 @@ class FLMBase(trainer_base.TrainerBase):
             new_state_dict[new_key] = v
         return new_state_dict
 
-    def forward_no_softmax(self, xt, tau, tau_prime=None, **kwargs):
+    def forward_no_softmax(self, xt, tau, tau_prime=None, self_cond=None,
+                           **kwargs):
         tau = self._process_sigma(tau)
         if tau_prime is not None:
             tau_prime = self._process_sigma(tau_prime)
+        backbone_kwargs = dict(kwargs)
+        if self_cond is not None:
+            backbone_kwargs['self_cond'] = self_cond
         with torch.amp.autocast(device_type=self.device.type, dtype=torch.float32):
-            model_output = self.backbone(xt, tau, tau_prime, **kwargs)
+            model_output = self.backbone(
+                xt, tau, tau_prime, **backbone_kwargs)
         return model_output
 
     def _extract_ema_state_dict(self, model, checkpoint):
@@ -1049,6 +1054,9 @@ class FLM(FLMBase):
             loss_weight = loss_weight.unsqueeze(-1)
             loss = torch.exp(-loss_weight) * loss + loss_weight
             self.log('loss_weighted', loss.mean(), prog_bar=True)
+        # dt_dtau = utils.d_alpha_to_gamma(tau_t, self.lut_a2g)
+        # loss_weight = (2 * t * dt_dtau) / (1 - t)**3
+        # return loss * loss_weight[:, None]
         return loss
 
     @torch.no_grad()
@@ -1081,8 +1089,7 @@ class FLM(FLMBase):
             z = z + dt.view(-1, 1, 1) * v
 
         return z.argmax(dim=-1)
-
-
+    
 class FLMBlock(FLM):
     """Blockwise FLM with duplicated clean/noisy streams.
 
@@ -1304,7 +1311,6 @@ class FLMBlock(FLM):
 
             tokens[:, start:end] = z_block.argmax(dim=-1)
         return tokens
-
 
 class FMLM(FLMBase):
     def __init__(self, config, tokenizer):
@@ -2053,6 +2059,625 @@ class FMLMBlock(FMLM, FLMBlock):
             tokens[:, start:end] = z_block.argmax(dim=-1)
         return tokens
 
+class FLMVDM(FLM):
+    def __init__(self, config, tokenizer):
+        super().__init__(config, tokenizer)
+        self.train_t_min = self.t_min
+        self.train_t_max = self.t_max
+        self.val_t_min = getattr(config.algo, 'val_t_min', self.train_t_min)
+        self.val_t_max = getattr(config.algo, 'val_t_max', self.train_t_max)
+        self.interpolant_type = getattr(config.algo, 'interpolant_type', 'vp_vdm')
+        self.cond_t = getattr(config.algo, 'cond_t', 'tau')
+        self.gamma_min = getattr(config.algo, 'gamma_min', -5.)
+        self.gamma_max = getattr(config.algo, 'gamma_max', 5.)
+        self.noise_proposal = getattr(config.algo, 'noise_proposal', 'tau')
+        self.train_objective = getattr(config.algo, 'train_objective', 'vlb')
+        self.gamma_proposal_loc = float(
+            getattr(config.algo, 'gamma_proposal_loc', 0.0))
+        self.gamma_proposal_scale = float(
+            getattr(config.algo, 'gamma_proposal_scale', 1.0))
+        self.vlb_proposal_floor = float(
+            getattr(config.algo, 'vlb_proposal_floor', 0.05))
+        self.train_loss = getattr(config.algo, 'train_loss', 'ce')
+        self.train_on_weighted_loss = getattr(config.algo, 'train_on_weighted_loss', True)
+        self.diagnostic_num_bins = getattr(config.algo, 'diagnostic_num_bins', 8)
+        self.self_conditioning_cfg = getattr(config.algo, 'self_conditioning', None)
+        self.self_conditioning_enabled = bool(
+            getattr(self.self_conditioning_cfg, 'enabled', False))
+        self.self_conditioning_train_prob = float(
+            getattr(self.self_conditioning_cfg, 'train_prob', 0.25))
+        if self.interpolant_type != 'vp_vdm':
+            raise NotImplementedError(
+                "FLMVDM currently supports only interpolant_type='vp_vdm', "
+                f"got {self.interpolant_type}")
+        self._validate_proposal_config()
+        if not 0.0 <= self.self_conditioning_train_prob <= 1.0:
+            raise ValueError(
+                "self_conditioning.train_prob must be in [0, 1], "
+                f"got {self.self_conditioning_train_prob}")
+        if (self.self_conditioning_enabled
+                and self.config.algo.backbone != 'dit'):
+            raise NotImplementedError(
+                "FLM-VDM self-conditioning is only implemented for the DiT "
+                f"backbone, got {self.config.algo.backbone}")
+        self.lut_tau2gamma, self.lut_gamma2tau = utils.build_vp_luts(
+            K=self.vocab_size,
+            gamma_min=self.gamma_min,
+            gamma_max=self.gamma_max,
+        )
+
+    def _tau_to_gamma(self, tau):
+        return utils.tau_to_gamma(tau, self.lut_tau2gamma)
+
+    def _gamma_to_tau(self, gamma):
+        return utils.gamma_to_tau(gamma, self.lut_gamma2tau)
+
+    def _d_gamma_by_d_tau(self, tau):
+        return utils.d_tau_to_gamma(tau, self.lut_tau2gamma)
+
+    def _validate_proposal_config(self):
+        if self.noise_proposal not in {'tau', 'gamma_gumbel'}:
+            raise ValueError(
+                "algo.noise_proposal must be one of "
+                "{'tau', 'gamma_gumbel'}, "
+                f"got {self.noise_proposal}")
+        if self.train_objective not in {'vlb', 'bounded_vlb', 'proposal_ce'}:
+            raise ValueError(
+                "algo.train_objective must be one of "
+                "{'vlb', 'bounded_vlb', 'proposal_ce'}, "
+                f"got {self.train_objective}")
+        if self.noise_proposal == 'tau' and self.train_objective != 'vlb':
+            raise ValueError(
+                "algo.train_objective must be 'vlb' when "
+                "algo.noise_proposal='tau'")
+        if self.noise_proposal == 'gamma_gumbel' and self.train_objective == 'vlb':
+            raise ValueError(
+                "algo.train_objective='vlb' is only defined for "
+                "algo.noise_proposal='tau'; use 'bounded_vlb' for "
+                "importance-corrected gamma proposals")
+        if self.gamma_proposal_scale <= 0:
+            raise ValueError(
+                "algo.gamma_proposal_scale must be positive, "
+                f"got {self.gamma_proposal_scale}")
+        if not 0.0 < self.vlb_proposal_floor <= 1.0:
+            raise ValueError(
+                "algo.vlb_proposal_floor must be in (0, 1], "
+                f"got {self.vlb_proposal_floor}")
+
+    def _get_noise_conditioning(self, tau_t, gamma):
+        if self.cond_t == 'tau':
+            return tau_t
+        if self.cond_t == 'snr':
+            return torch.exp(-gamma)
+        if self.cond_t == 'log_snr':
+            return -gamma
+        if self.cond_t == 'nsr':
+            return torch.exp(gamma)
+        if self.cond_t == 'log_nsr':
+            return gamma
+        raise ValueError(f"Unknown cond_t: {self.cond_t}")
+
+    def _log_stage_metric(self, stage, name, value, group=None):
+        if torch.is_tensor(value):
+            value = value.detach()
+        if group is None:
+            metric_name = f'{stage}/{name}'
+        else:
+            metric_name = f'{stage}_{group}/{name}'
+        self.log(metric_name,
+                 value,
+                 on_step=self.training,
+                 on_epoch=not self.training,
+                 sync_dist=True)
+
+    def _log_distribution_stats(self, stage, name, values, group=None):
+        values = values.detach().float().reshape(-1)
+        if values.numel() == 0:
+            return
+
+        self._log_stage_metric(stage, f'{name}_mean', values.mean(),
+                               group=group)
+        self._log_stage_metric(stage, f'{name}_median', values.median(),
+                               group=group)
+        quantiles = torch.quantile(
+            values, torch.tensor([0.9, 0.99], device=values.device))
+        self._log_stage_metric(stage, f'{name}_p90', quantiles[0],
+                               group=group)
+        self._log_stage_metric(stage, f'{name}_p99', quantiles[1],
+                               group=group)
+        self._log_stage_metric(stage, f'{name}_max', values.max(),
+                               group=group)
+
+    def _log_weight_diagnostics(self, stage, tau, gamma, snr, snr_width,
+                                snr_prime_tau, dgamma_dtau, loss_weight,
+                                train_weight, vlb_weight,
+                                normalized_vlb_weight,
+                                proposal_density=None,
+                                vlb_gamma_density=None):
+        self._log_distribution_stats(stage, 'tau', tau, group='stats')
+        self._log_distribution_stats(stage, 'gamma', gamma, group='stats')
+        self._log_distribution_stats(stage, 'snr', snr, group='stats')
+        self._log_distribution_stats(stage, 'snr_width', snr_width,
+                                     group='stats')
+        self._log_distribution_stats(stage, 'snr_prime_tau', snr_prime_tau,
+                                     group='stats')
+        self._log_distribution_stats(stage, 'dgamma_dtau', dgamma_dtau,
+                                     group='stats')
+        self._log_distribution_stats(stage, 'loss_weight', loss_weight,
+                                     group='stats')
+        self._log_distribution_stats(stage, 'train_weight', train_weight,
+                                     group='stats')
+        self._log_distribution_stats(stage, 'vlb_weight', vlb_weight,
+                                     group='stats')
+        self._log_distribution_stats(stage, 'normalized_vlb_weight',
+                                     normalized_vlb_weight,
+                                     group='stats')
+        if proposal_density is not None:
+            self._log_distribution_stats(stage, 'proposal_density',
+                                         proposal_density,
+                                         group='stats')
+        if vlb_gamma_density is not None:
+            self._log_distribution_stats(stage, 'vlb_gamma_density',
+                                         vlb_gamma_density,
+                                         group='stats')
+
+        weight_sum = loss_weight.sum().clamp_min(1e-12)
+        ess = weight_sum.square() / loss_weight.square().sum().clamp_min(1e-12)
+        self._log_stage_metric(stage, 'loss_weight_ess', ess, group='stats')
+        self._log_stage_metric(stage, 'loss_weight_ess_frac',
+                               ess / max(loss_weight.numel(), 1),
+                               group='stats')
+
+        vlb_weight_sum = vlb_weight.sum().clamp_min(1e-12)
+        vlb_ess = (
+            vlb_weight_sum.square()
+            / vlb_weight.square().sum().clamp_min(1e-12))
+        self._log_stage_metric(stage, 'vlb_weight_ess', vlb_ess,
+                               group='stats')
+        self._log_stage_metric(stage, 'vlb_weight_ess_frac',
+                               vlb_ess / max(vlb_weight.numel(), 1),
+                               group='stats')
+
+    def _log_objective_diagnostics(self, stage, tau, target_data,
+                                   log_softmax_pred, vlb_weight,
+                                   train_weight):
+        probs = log_softmax_pred.exp()
+        ce_loss = -(target_data * log_softmax_pred).sum(dim=-1)
+        l2_loss = ((target_data - probs) ** 2).sum(dim=-1)
+        true_token_prob = (target_data * probs).sum(dim=-1)
+        pred_tokens = log_softmax_pred.argmax(dim=-1)
+        target_tokens = target_data.argmax(dim=-1)
+        token_accuracy = (pred_tokens == target_tokens).float()
+
+        broadcast_weight = vlb_weight.expand_as(ce_loss)
+        weight_sum = broadcast_weight.sum().clamp_min(1e-12)
+        broadcast_train_weight = train_weight.expand_as(ce_loss)
+        train_weight_sum = broadcast_train_weight.sum().clamp_min(1e-12)
+
+        self._log_stage_metric(
+            stage, 'ce_weighted_normalized',
+            (ce_loss * broadcast_weight).sum() / weight_sum,
+            group='objective')
+        self._log_stage_metric(
+            stage, 'l2_weighted_normalized',
+            (0.5 * l2_loss * broadcast_weight).sum() / weight_sum,
+            group='objective')
+        self._log_stage_metric(
+            stage, 'ce_train_weighted_normalized',
+            (ce_loss * broadcast_train_weight).sum() / train_weight_sum,
+            group='objective')
+        self._log_stage_metric(
+            stage, 'l2_train_weighted_normalized',
+            (0.5 * l2_loss * broadcast_train_weight).sum()
+            / train_weight_sum,
+            group='objective')
+        self._log_stage_metric(stage, 'token_accuracy',
+                               token_accuracy.mean(),
+                               group='objective')
+        self._log_stage_metric(
+            stage, 'token_accuracy_weighted_normalized',
+            (token_accuracy * broadcast_weight).sum() / weight_sum,
+            group='objective')
+        self._log_stage_metric(
+            stage, 'token_accuracy_train_weighted_normalized',
+            (token_accuracy * broadcast_train_weight).sum()
+            / train_weight_sum,
+            group='objective')
+        self._log_stage_metric(stage, 'true_token_prob_mean',
+                               true_token_prob.mean(),
+                               group='objective')
+        self._log_distribution_stats(stage, 'true_token_prob',
+                                     true_token_prob,
+                                     group='objective')
+
+        if self.training:
+            return
+
+        ce_per_sample = ce_loss.mean(dim=-1)
+        weighted_ce_per_sample = ce_per_sample * vlb_weight.squeeze(-1)
+        token_accuracy_per_sample = token_accuracy.mean(dim=-1)
+        num_bins = max(int(self.diagnostic_num_bins), 1)
+        edges = torch.linspace(0.0, 1.0, num_bins + 1, device=tau.device)
+        bin_ids = torch.bucketize(tau.detach(), edges[1:-1])
+
+        zero = tau.new_tensor(0.0)
+        for bin_idx in range(num_bins):
+            mask = bin_ids == bin_idx
+            if mask.any():
+                self._log_stage_metric(
+                    stage, f'tau_bin_{bin_idx}_frac',
+                    mask.float().mean(),
+                    group='objective')
+                self._log_stage_metric(
+                    stage, f'tau_bin_{bin_idx}_mean',
+                    tau[mask].mean(),
+                    group='objective')
+                self._log_stage_metric(
+                    stage, f'tau_bin_{bin_idx}_ce',
+                    ce_per_sample[mask].mean(),
+                    group='objective')
+                self._log_stage_metric(
+                    stage, f'tau_bin_{bin_idx}_weight',
+                    vlb_weight.squeeze(-1)[mask].mean(),
+                    group='objective')
+                self._log_stage_metric(
+                    stage, f'tau_bin_{bin_idx}_weighted_ce',
+                    weighted_ce_per_sample[mask].mean(),
+                    group='objective')
+                self._log_stage_metric(
+                    stage, f'tau_bin_{bin_idx}_accuracy',
+                    token_accuracy_per_sample[mask].mean(),
+                    group='objective')
+            else:
+                self._log_stage_metric(stage, f'tau_bin_{bin_idx}_frac', zero,
+                                       group='objective')
+                self._log_stage_metric(stage, f'tau_bin_{bin_idx}_mean', zero,
+                                       group='objective')
+                self._log_stage_metric(stage, f'tau_bin_{bin_idx}_ce', zero,
+                                       group='objective')
+                self._log_stage_metric(stage, f'tau_bin_{bin_idx}_weight', zero,
+                                       group='objective')
+                self._log_stage_metric(
+                    stage, f'tau_bin_{bin_idx}_weighted_ce', zero,
+                    group='objective')
+                self._log_stage_metric(stage, f'tau_bin_{bin_idx}_accuracy', zero,
+                                       group='objective')
+    
+    def corrupt_continuous(self, x0, tau_t, gamma, dgamma_dtau, stage,
+                           proposal_density=None, vlb_gamma_density=None):
+        target_data = F.one_hot(x0, self.vocab_size).float()
+        noise = torch.randn_like(target_data, dtype=torch.float32)
+        train_weight, vlb_weight, diagnostics = self._compute_loss_weights(
+            tau_t,
+            gamma,
+            dgamma_dtau,
+            proposal_density=proposal_density,
+            vlb_gamma_density=vlb_gamma_density,
+        )
+
+        alpha = torch.sigmoid(-gamma).sqrt().unsqueeze(-1).unsqueeze(-1)
+        sigma = torch.sigmoid(gamma).sqrt().unsqueeze(-1).unsqueeze(-1)
+        self._log_stage_metric(stage, 'alpha_mean', alpha.mean(),
+                               group='stats')
+        self._log_stage_metric(stage, 'sigma_mean', sigma.mean(),
+                               group='stats')
+
+        x_t = alpha * target_data + sigma * noise
+        cond_t = self._get_noise_conditioning(tau_t, gamma)
+        return (
+            x_t,
+            cond_t,
+            target_data,
+            train_weight.unsqueeze(-1),
+            vlb_weight.unsqueeze(-1),
+            diagnostics,
+        )
+    
+    def _ce_loss(self, target_data, log_softmax_pred, vlb_weight,
+                 train_weight, stage):
+        loss = -(target_data * log_softmax_pred).sum(dim=-1)
+        self._log_stage_metric(stage, 'ce_unweighted',
+                               loss.mean().detach(),
+                               group='objective')
+        self._log_stage_metric(stage, 'ce_weighted',
+                               (loss * vlb_weight).mean().detach(),
+                               group='objective')
+        self._log_stage_metric(stage, 'ce_train_weighted',
+                               (loss * train_weight).mean().detach(),
+                               group='objective')
+        return loss, train_weight
+
+    def _l2_loss(self, target_data, log_softmax_pred, vlb_weight,
+                 train_weight, stage):
+        loss = ((target_data - log_softmax_pred.exp()) ** 2).sum(dim=-1)
+        self._log_stage_metric(stage, 'l2_unweighted',
+                               loss.mean().detach(),
+                               group='objective')
+        self._log_stage_metric(stage, 'l2_weighted',
+                               (0.5 * loss * vlb_weight).mean().detach(),
+                               group='objective')
+        self._log_stage_metric(stage, 'l2_train_weighted',
+                               (0.5 * loss * train_weight).mean().detach(),
+                               group='objective')
+        return loss, 0.5 * train_weight
+
+    def _gamma_support(self, device, dtype):
+        gamma_min = torch.tensor(self.gamma_min, device=device, dtype=dtype)
+        gamma_max = torch.tensor(self.gamma_max, device=device, dtype=dtype)
+        return gamma_min, gamma_max
+
+    def _snr_width(self, device, dtype):
+        gamma_min, gamma_max = self._gamma_support(device, dtype)
+        return (torch.exp(-gamma_min) - torch.exp(-gamma_max)).clamp_min(1e-12)
+
+    def _truncated_gumbel_cdf(self, gamma, loc, scale):
+        z = (gamma - loc) / scale
+        return torch.exp(-torch.exp(-z))
+
+    def _truncated_gumbel_pdf(self, gamma, loc, scale,
+                              gamma_min, gamma_max):
+        z = (gamma - loc) / scale
+        pdf = torch.exp(-(z + torch.exp(-z))) / scale
+        cdf_min = self._truncated_gumbel_cdf(gamma_min, loc, scale)
+        cdf_max = self._truncated_gumbel_cdf(gamma_max, loc, scale)
+        return pdf / (cdf_max - cdf_min).clamp_min(1e-12)
+
+    def _sample_truncated_gumbel_gamma(self, unit):
+        dtype = unit.dtype
+        device = unit.device
+        work_unit = unit.double()
+        gamma_min, gamma_max = self._gamma_support(device, torch.float64)
+        loc = torch.tensor(self.gamma_proposal_loc, device=device,
+                           dtype=torch.float64)
+        scale = torch.tensor(self.gamma_proposal_scale, device=device,
+                             dtype=torch.float64)
+        cdf_min = self._truncated_gumbel_cdf(gamma_min, loc, scale)
+        cdf_max = self._truncated_gumbel_cdf(gamma_max, loc, scale)
+        u = cdf_min + work_unit * (cdf_max - cdf_min)
+        u = u.clamp(1e-12, 1.0 - 1e-7)
+        gamma = loc - scale * torch.log(-torch.log(u))
+        return gamma.to(dtype=dtype)
+
+    def _sample_vlb_gamma(self, unit):
+        dtype = unit.dtype
+        device = unit.device
+        gamma_min, gamma_max = self._gamma_support(device, dtype)
+        snr_max = torch.exp(-gamma_min)
+        snr_min = torch.exp(-gamma_max)
+        snr = snr_max - unit * (snr_max - snr_min)
+        return -torch.log(snr.clamp_min(1e-12))
+
+    def _vlb_gamma_density(self, gamma):
+        snr_width = self._snr_width(gamma.device, gamma.dtype)
+        return torch.exp(-gamma) / snr_width
+
+    def _proposal_gamma_density(self, gamma):
+        gamma_min, gamma_max = self._gamma_support(gamma.device, gamma.dtype)
+        loc = torch.tensor(self.gamma_proposal_loc, device=gamma.device,
+                           dtype=gamma.dtype)
+        scale = torch.tensor(self.gamma_proposal_scale, device=gamma.device,
+                             dtype=gamma.dtype)
+        gumbel_density = self._truncated_gumbel_pdf(
+            gamma, loc, scale, gamma_min, gamma_max)
+        vlb_density = self._vlb_gamma_density(gamma)
+        floor = self.vlb_proposal_floor
+        proposal_density = floor * vlb_density + (1.0 - floor) * gumbel_density
+        return proposal_density, vlb_density
+
+    def _sample_gamma_proposal(self, B, accum_step):
+        mix_unit = self._sample_t_interval(
+            B, accum_step, t_min=0.0, t_max=1.0)
+        sample_unit = self._sample_t_interval(
+            B, accum_step, t_min=0.0, t_max=1.0)
+        gamma_gumbel = self._sample_truncated_gumbel_gamma(sample_unit)
+        gamma_vlb = self._sample_vlb_gamma(sample_unit)
+        use_vlb_component = mix_unit < self.vlb_proposal_floor
+        gamma = torch.where(use_vlb_component, gamma_vlb, gamma_gumbel)
+        proposal_density, vlb_density = self._proposal_gamma_density(gamma)
+        return gamma, proposal_density, vlb_density
+
+    def _compute_loss_weights(self, tau_t, gamma, dgamma_dtau,
+                              proposal_density=None,
+                              vlb_gamma_density=None):
+        snr = torch.exp(-gamma)
+        snr_width = self._snr_width(gamma.device, gamma.dtype)
+        # Positive derivative dSNR / dtau under the VP parameterization.
+        snr_prime_tau = snr * (-dgamma_dtau)
+
+        if proposal_density is None:
+            vlb_weight = snr_prime_tau
+            normalized_vlb_weight = vlb_weight / snr_width
+        else:
+            normalized_vlb_weight = (
+                vlb_gamma_density
+                / proposal_density.clamp_min(1e-12))
+            vlb_weight = snr_width * normalized_vlb_weight
+
+        if not self.training or self.train_objective == 'vlb':
+            train_weight = vlb_weight
+        elif self.train_objective == 'bounded_vlb':
+            train_weight = normalized_vlb_weight
+        elif self.train_objective == 'proposal_ce':
+            train_weight = torch.ones_like(vlb_weight)
+        else:
+            raise ValueError(f"Unknown train_objective: {self.train_objective}")
+
+        diagnostics = {
+            'tau': tau_t,
+            'gamma': gamma,
+            'snr': snr,
+            'snr_width': snr_width,
+            'snr_prime_tau': snr_prime_tau,
+            'dgamma_dtau': dgamma_dtau,
+            'loss_weight': train_weight,
+            'train_weight': train_weight,
+            'vlb_weight': vlb_weight,
+            'normalized_vlb_weight': normalized_vlb_weight,
+            'proposal_density': proposal_density,
+            'vlb_gamma_density': vlb_gamma_density,
+        }
+        return train_weight, vlb_weight, diagnostics
+
+    def _sample_tau_coordinates(self, B, accum_step):
+        if self.training and self.noise_proposal == 'gamma_gumbel':
+            gamma, proposal_density, vlb_gamma_density = (
+                self._sample_gamma_proposal(B, accum_step))
+            tau_t = self._gamma_to_tau(gamma)
+        else:
+            t_min, t_max = (
+                (self.train_t_min, self.train_t_max)
+                if self.training else (self.val_t_min, self.val_t_max))
+            tau_t = self._sample_t_interval(
+                B,
+                accum_step,
+                t_min=t_min,
+                t_max=t_max,
+            )
+            gamma = self._tau_to_gamma(tau_t)
+            proposal_density = None
+            vlb_gamma_density = None
+        dgamma_dtau = self._d_gamma_by_d_tau(tau_t)
+        return tau_t, gamma, dgamma_dtau, proposal_density, vlb_gamma_density
+
+    def _build_self_conditioning(self, x_t, cond_t, self_cond_mask=None):
+        if not self.self_conditioning_enabled:
+            return None
+
+        if self_cond_mask is None:
+            with torch.no_grad():
+                return self.forward(x_t, cond_t).detach().exp()
+
+        self_cond = torch.zeros_like(x_t)
+        if not self_cond_mask.any():
+            return self_cond
+
+        with torch.no_grad():
+            self_cond[self_cond_mask] = self.forward(
+                x_t[self_cond_mask],
+                cond_t[self_cond_mask],
+            ).detach().exp()
+        return self_cond
+
+    def loss(self, x0, output_tokens,
+             current_accumulation_step=None, train_mode=False,
+             xT=None, given_t=None, not_sampling_t=False):
+        del given_t, not_sampling_t, output_tokens
+        stage = 'train' if self.training else 'val'
+        B = x0.shape[0]
+        (tau_t, gamma, dgamma_dtau, proposal_density,
+         vlb_gamma_density) = self._sample_tau_coordinates(
+             B, current_accumulation_step)
+
+        (x_t, cond_t, target_data, train_weight, vlb_weight,
+         diagnostics) = self.corrupt_continuous(
+             x0,
+             tau_t,
+             gamma,
+             dgamma_dtau,
+             stage,
+             proposal_density=proposal_density,
+             vlb_gamma_density=vlb_gamma_density,
+         )
+        self_cond = None
+        if self.self_conditioning_enabled:
+            if self.training:
+                self_cond_mask = (
+                    torch.rand(B, device=self.device)
+                    < self.self_conditioning_train_prob)
+                self_cond = self._build_self_conditioning(
+                    x_t, cond_t, self_cond_mask=self_cond_mask)
+                self._log_stage_metric(
+                    stage, 'selfcond_frac', self_cond_mask.float().mean(),
+                    group='stats')
+            else:
+                self_cond = self._build_self_conditioning(x_t, cond_t)
+                self._log_stage_metric(
+                    stage, 'selfcond_frac',
+                    x_t.new_tensor(1.0),
+                    group='stats')
+        else:
+            self._log_stage_metric(
+                stage, 'selfcond_frac',
+                x_t.new_tensor(0.0),
+                group='stats')
+
+        f = self.forward(x_t, cond_t, self_cond=self_cond)
+        self._log_weight_diagnostics(stage, **diagnostics)
+        self._log_objective_diagnostics(stage, diagnostics['tau'],
+                                        target_data, f, vlb_weight,
+                                        train_weight)
+        if self.train_loss == 'ce':
+            with torch.no_grad():
+                _, _ = self._l2_loss(target_data, f, vlb_weight,
+                                     train_weight, stage)
+            loss, loss_weight = self._ce_loss(target_data, f, vlb_weight,
+                                             train_weight, stage)
+        elif self.train_loss == 'l2':
+            with torch.no_grad():
+                _, _ = self._ce_loss(target_data, f, vlb_weight,
+                                     train_weight, stage)
+            loss, loss_weight = self._l2_loss(target_data, f, vlb_weight,
+                                             train_weight, stage)
+        else:
+            raise NotImplementedError(f"Train loss {self.train_loss} not implemented!")
+        self.log('loss', loss.mean(), prog_bar=True)
+        if self.train_on_weighted_loss is True:
+            loss = loss * loss_weight
+            self.log('loss_weighted', loss.mean(), prog_bar=True)
+        return loss
+
+    @torch.no_grad()
+    def generate_samples(self, num_samples, num_steps=None, eps=1e-5):
+        """Generate samples with a deterministic Gaussian-path update."""
+        del eps
+        if num_steps is None:
+            num_steps = self.config.sampling.steps
+        if num_steps < 1:
+            raise ValueError("num_steps must be >= 1")
+
+        B = num_samples
+        V = self.vocab_size
+        L = self.num_tokens
+        device = self.device
+        sigma_floor = 1e-5
+
+        t_min, t_max = self.val_t_min, self.val_t_max
+        tau_vals = torch.linspace(
+            t_min, t_max, num_steps + 1, device=device)
+        gamma_vals = self._tau_to_gamma(tau_vals)
+
+        gamma_start = gamma_vals[0]
+        sigma_start = torch.sigmoid(gamma_start).sqrt()
+        z = sigma_start * torch.randn(
+            (num_samples, L, V), device=device, dtype=self.dtype)
+        self_cond_probs = None
+
+        for i in range(num_steps):
+            tau_curr = tau_vals[i].expand(B)
+            tau_next = tau_vals[i + 1].expand(B)
+            gamma_curr = gamma_vals[i].expand(B)
+            alpha_curr = torch.sigmoid(-gamma_curr).sqrt().view(-1, 1, 1)
+            sigma_curr = torch.sigmoid(gamma_curr).sqrt().view(-1, 1, 1)
+            cond_curr = self._get_noise_conditioning(tau_curr, gamma_curr)
+
+            x_hat0 = self.forward(
+                z, cond_curr, self_cond=self_cond_probs).exp()
+            if self.self_conditioning_enabled:
+                self_cond_probs = x_hat0.detach()
+            eps_hat = (
+                z - alpha_curr * x_hat0
+            ) / sigma_curr.clamp_min(sigma_floor)
+
+            gamma_next = gamma_vals[i + 1].expand(B)
+            alpha_next = torch.sigmoid(-gamma_next).sqrt().view(-1, 1, 1)
+            sigma_next = torch.sigmoid(gamma_next).sqrt().view(-1, 1, 1)
+            z = alpha_next * x_hat0 + sigma_next * eps_hat
+
+        tau_end = tau_vals[-1].expand(B)
+        gamma_end = gamma_vals[-1].expand(B)
+        cond_end = self._get_noise_conditioning(tau_end, gamma_end)
+        return self.forward(
+            z, cond_end, self_cond=self_cond_probs).argmax(dim=-1)
 
 class FMLM_TwoModel(FLMBase):
     """FMLM two-model parameterization (appendix: semigroup loss, first stage of two-stage MSE distillation)."""
