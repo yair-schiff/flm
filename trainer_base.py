@@ -321,12 +321,11 @@ class TrainerBase(L.LightningModule):
             backbone_kwargs['self_cond'] = self_cond
         with torch.amp.autocast(device_type=self.device.type, dtype=torch.float32):
             model_output = self.backbone(
-                
                 xt,
                 sigma,
                 sigma_prime,
                 **backbone_kwargs,
-            , **kwargs)
+                **kwargs)
         
         return self._process_model_output(
             model_output=model_output, xt=xt, sigma=sigma)
