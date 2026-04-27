@@ -1,0 +1,33 @@
+# Clean VDM-style FLM training on one-hot token latents.
+
+name: flm_vdm
+backbone: dit  # dit / dimamba / hf_dit
+parameterization: mean
+time_conditioning: True
+T: 0
+subs_masking: False
+causal_attention: False
+ignore_bos: False
+t_max: 1.0
+t_min: 0.0
+val_t_min: ${.t_min}
+val_t_max: ${.t_max}
+double_temb: False
+learnable_loss_weighting: False
+
+latent_type: vp  # vp, linear_interp
+cond_t: gamma  # tau, alpha, signal, gamma, log_nsr, nsr, log_snr, snr
+train_loss: ce  # ce, l2
+train_on_weighted_loss: False
+importance_sampling: ${training.importance_sampling}
+
+schedule:
+  type: linear  # linear, learned_vdm, argmax_uncertainty, snr_power
+  gamma_min: -5.0
+  gamma_max: 5.0
+  C: 17.276323318481445
+  p: 0.43169814348220825
+  eps: 1e-6
+  hidden_size: 1024
+  n_points: 10000
+  n_gh: 100

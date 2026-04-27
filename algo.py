@@ -1,6 +1,7 @@
 import os
 import collections
 import copy
+import itertools
 import pickle
 
 import fsspec
@@ -10,6 +11,7 @@ import torch.nn.functional as F
 import wandb
 import trainer_base
 import utils
+import noise_schedules
 import math
 import models
 from torch.func import functional_call
@@ -1094,6 +1096,47 @@ class FLMVDM(FLM):
         self.cond_t = getattr(config.algo, 'cond_t', 'gamma')
         self.train_loss = getattr(config.algo, 'train_loss', 'ce')
         self.train_on_weighted_loss = getattr(config.algo, 'train_on_weighted_loss', False)
+        self.schedule_cfg = getattr(config.algo, 'schedule', None)
+        self.schedule_type = self._schedule_get(
+            'type', getattr(config.algo, 'noise_schedule', 'linear'))
+        importance_sampling = bool(getattr(
+            getattr(config, 'training', None), 'importance_sampling', False))
+        self.importance_sampling = bool(self._schedule_get(
+            'importance_sampling', importance_sampling))
+
+        schedule_eps = self._schedule_get(
+            'eps', 1e-6 if self.schedule_type == 'snr_power' else 1e-12)
+        self.noise_schedule = noise_schedules.build_noise_schedule(
+            self.schedule_type,
+            vocab_size=self.vocab_size,
+            gamma_min=self._schedule_get('gamma_min', None),
+            gamma_max=self._schedule_get('gamma_max', None),
+            C=self._schedule_get('C', self._schedule_get(
+                'c', 17.276323318481445)),
+            p=self._schedule_get('p', 0.43169814348220825),
+            eps=schedule_eps,
+            hidden_size=self._schedule_get('hidden_size', 1024),
+            n_points=self._schedule_get('n_points', 10000),
+            n_gh=self._schedule_get('n_gh', 100),
+        )
+        if (self.ema is not None
+                and any(p.requires_grad
+                        for p in self.noise_schedule.parameters())):
+            self.ema = models.ema.ExponentialMovingAverage(
+                self._get_parameters(), decay=self.config.training.ema)
+
+    def _schedule_get(self, name, default=None):
+        if self.schedule_cfg is not None and hasattr(self.schedule_cfg, name):
+            value = getattr(self.schedule_cfg, name)
+            if value is not None:
+                return value
+        return getattr(self.config.algo, name, default)
+
+    def _get_parameters(self):
+        params = super()._get_parameters()
+        if not hasattr(self, 'noise_schedule'):
+            return params
+        return itertools.chain(params, self.noise_schedule.parameters())
     
     @property
     def _t_min(self):
@@ -1154,18 +1197,38 @@ class FLMVDM(FLM):
                                (0.5 * loss * vlb_weight).mean().detach(),
                                group='objective')
         return loss
-    
-    def _noise_variables(self, tau):
-        gamma, vlb_weight = None, None  # TODO: implement different noising schedules
-        if self.latent_type == 'vp': # alpha^2 + sigma^2 = 1
+
+    def _unit_interval_from_tau(self, tau):
+        width = max(self._t_max - self._t_min, 1e-12)
+        return ((tau - self._t_min) / width).clamp(0.0, 1.0)
+
+    def _alpha_sigma_from_gamma(self, gamma):
+        if self.latent_type == 'vp':  # alpha^2 + sigma^2 = 1
             alpha = torch.sigmoid(-gamma).sqrt()
             sigma = torch.sigmoid(gamma).sqrt()
-        elif self.latent_type == 'linear_interp':  # alpha + sigma = 1
+        elif self.latent_type in {'linear_interp', 'linear'}:  # alpha + sigma = 1
             alpha = torch.sigmoid(-gamma / 2.)
-            sigma = torch.sigmoid(gamma  / 2.)
+            sigma = torch.sigmoid(gamma / 2.)
         else:
             raise ValueError(f"Unknown latent_type: {self.latent_type}")
-        return alpha, sigma, gamma, vlb_weight
+        return alpha, sigma
+    
+    def _noise_variables(self, tau):
+        tau_for_cond = tau
+        if self.importance_sampling:
+            unit = self._unit_interval_from_tau(tau)
+            tau_for_cond, gamma, vlb_weight = (
+                self.noise_schedule.importance_sample(unit, t_max=self._t_max))
+        else:
+            gamma, vlb_weight = self.noise_schedule(tau)
+        alpha, sigma = self._alpha_sigma_from_gamma(gamma)
+        return alpha, sigma, gamma, vlb_weight.unsqueeze(-1), tau_for_cond
+
+    def _sampling_noise_grid(self, num_steps, device):
+        tau_vals = torch.linspace(
+            self.val_t_min, self.val_t_max, num_steps + 1, device=device)
+        gamma_vals = self.noise_schedule.gamma(tau_vals)
+        return tau_vals, gamma_vals
     
     def corrupt_continuous(self, x0, alpha, sigma):
         alpha = alpha.unsqueeze(-1).unsqueeze(-1)
@@ -1183,9 +1246,10 @@ class FLMVDM(FLM):
         B = x0.shape[0]
         tau_t = self._sample_t_interval(B, current_accumulation_step,
                                     t_min=self._t_min, t_max=self._t_max)
-        alpha, sigma, gamma, vlb_weight = self._noise_variables(tau_t)
+        alpha, sigma, gamma, vlb_weight, tau_for_cond = (
+            self._noise_variables(tau_t))
         x_t, target_data = self.corrupt_continuous(x0, alpha, sigma)
-        cond_t = self._get_noise_conditioning(tau_t, alpha, gamma)
+        cond_t = self._get_noise_conditioning(tau_for_cond, alpha, gamma)
         f = self.forward(x_t, cond_t)
 
         if self.train_loss == 'ce':
@@ -1203,6 +1267,52 @@ class FLMVDM(FLM):
             loss = loss * vlb_weight
             self.log('loss_weighted', loss.mean(), prog_bar=True)
         return loss
+
+    @torch.no_grad()
+    def generate_samples(self, num_samples, num_steps=None, eps=1e-5):
+        if num_steps is None:
+            num_steps = self.config.sampling.steps
+        if not isinstance(num_steps, int):
+            try:
+                num_steps = num_steps[0]
+            except (TypeError, KeyError):
+                pass
+        num_steps = int(num_steps)
+        if num_steps < 1:
+            raise ValueError("num_steps must be at least 1")
+
+        B = int(num_samples)
+        L = self.num_tokens
+        V = self.vocab_size
+        device = self.device
+        tau_vals, gamma_vals = self._sampling_noise_grid(num_steps, device)
+
+        _, sigma_start = self._alpha_sigma_from_gamma(gamma_vals[0])
+        z = sigma_start * torch.randn((B, L, V), device=device,
+                                      dtype=self.dtype)
+        sigma_floor = z.new_tensor(eps)
+
+        for i in range(num_steps):
+            tau_curr = tau_vals[i].expand(B)
+            gamma_curr = gamma_vals[i].expand(B)
+            alpha_curr, sigma_curr = self._alpha_sigma_from_gamma(gamma_curr)
+            cond_curr = self._get_noise_conditioning(
+                tau_curr, alpha_curr, gamma_curr)
+            x0_probs = self.forward(z, cond_curr).exp()
+            eps_hat = (
+                z - alpha_curr.view(-1, 1, 1) * x0_probs
+            ) / sigma_curr.clamp_min(sigma_floor).view(-1, 1, 1)
+
+            gamma_next = gamma_vals[i + 1].expand(B)
+            alpha_next, sigma_next = self._alpha_sigma_from_gamma(gamma_next)
+            z = (alpha_next.view(-1, 1, 1) * x0_probs
+                 + sigma_next.view(-1, 1, 1) * eps_hat)
+
+        tau_end = tau_vals[-1].expand(B)
+        gamma_end = gamma_vals[-1].expand(B)
+        alpha_end, _ = self._alpha_sigma_from_gamma(gamma_end)
+        cond_end = self._get_noise_conditioning(tau_end, alpha_end, gamma_end)
+        return self.forward(z, cond_end).argmax(dim=-1)
 
     
 class FMLM(FLMBase):
