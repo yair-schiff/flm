@@ -1081,6 +1081,129 @@ class FLM(FLMBase):
             z = z + dt.view(-1, 1, 1) * v
 
         return z.argmax(dim=-1)
+
+
+class FLMVDM(FLM):
+    def __init__(self, config, tokenizer):
+        super().__init__(config, tokenizer)
+        self.train_t_min = float(self.t_min)
+        self.train_t_max = float(self.t_max)
+        self.val_t_min = float(getattr(config.algo, 'val_t_min', self.train_t_min))
+        self.val_t_max = float(getattr(config.algo, 'val_t_max', self.train_t_max))
+        self.latent_type = getattr(config.algo, 'latent_type', 'vp')
+        self.cond_t = getattr(config.algo, 'cond_t', 'gamma')
+        self.train_loss = getattr(config.algo, 'train_loss', 'ce')
+        self.train_on_weighted_loss = getattr(config.algo, 'train_on_weighted_loss', False)
+    
+    @property
+    def _t_min(self):
+        if self.training:
+            return self.train_t_min
+        return self.val_t_min
+    
+    @property
+    def _t_max(self):
+        if self.training:
+            return self.train_t_max
+        return self.val_t_max
+    
+    def _log_stage_metric(self, stage, name, value, group=None):
+        if torch.is_tensor(value):
+            value = value.detach()
+        if group is None:
+            metric_name = f'{stage}/{name}'
+        else:
+            metric_name = f'{stage}_{group}/{name}'
+        self.log(metric_name,
+                 value,
+                 on_step=self.training,
+                 on_epoch=not self.training,
+                 sync_dist=True)
+
+    def _get_noise_conditioning(self, tau, alpha, gamma):
+        if self.cond_t == 'tau':
+            return tau
+        if self.cond_t in {'alpha', 'signal'}:
+            return alpha
+        if self.cond_t in {'gamma', 'log_nsr'}:
+            return gamma
+        if self.cond_t == 'nsr':
+            return torch.exp(gamma)
+        if self.cond_t == 'log_snr':
+            return -gamma
+        if self.cond_t == 'snr':
+            return torch.exp(-gamma)
+        raise ValueError(f"Unknown cond_t: {self.cond_t}")
+
+    def _ce_loss(self, target_data, log_softmax_pred, vlb_weight, stage):
+        loss = -(target_data * log_softmax_pred).sum(dim=-1)
+        self._log_stage_metric(stage, 'ce_unweighted',
+                               loss.mean().detach(),
+                               group='objective')
+        self._log_stage_metric(stage, 'ce_weighted',
+                               (loss * vlb_weight).mean().detach(),
+                               group='objective')
+        return loss
+
+    def _l2_loss(self, target_data, log_softmax_pred, vlb_weight, stage):
+        loss = ((target_data - log_softmax_pred.exp()) ** 2).sum(dim=-1)
+        self._log_stage_metric(stage, 'l2_unweighted',
+                               loss.mean().detach(),
+                               group='objective')
+        self._log_stage_metric(stage, 'l2_weighted',
+                               (0.5 * loss * vlb_weight).mean().detach(),
+                               group='objective')
+        return loss
+    
+    def _noise_variables(self, tau):
+        gamma, vlb_weight = None, None  # TODO: implement different noising schedules
+        if self.latent_type == 'vp': # alpha^2 + sigma^2 = 1
+            alpha = torch.sigmoid(-gamma).sqrt()
+            sigma = torch.sigmoid(gamma).sqrt()
+        elif self.latent_type == 'linear_interp':  # alpha + sigma = 1
+            alpha = torch.sigmoid(-gamma / 2.)
+            sigma = torch.sigmoid(gamma  / 2.)
+        else:
+            raise ValueError(f"Unknown latent_type: {self.latent_type}")
+        return alpha, sigma, gamma, vlb_weight
+    
+    def corrupt_continuous(self, x0, alpha, sigma):
+        alpha = alpha.unsqueeze(-1).unsqueeze(-1)
+        sigma = sigma.unsqueeze(-1).unsqueeze(-1)
+        target_data = F.one_hot(x0, self.vocab_size).float()
+        noise = torch.randn_like(target_data, dtype=torch.float32)
+        x_t = sigma * noise + alpha * target_data
+        return x_t, target_data
+
+    def loss(self, x0, output_tokens,
+            current_accumulation_step=None, train_mode=False,
+            xT=None, given_t=None, not_sampling_t=False):
+        del given_t, not_sampling_t, output_tokens
+        stage = 'train' if self.training else 'val'
+        B = x0.shape[0]
+        tau_t = self._sample_t_interval(B, current_accumulation_step,
+                                    t_min=self._t_min, t_max=self._t_max)
+        alpha, sigma, gamma, vlb_weight = self._noise_variables(tau_t)
+        x_t, target_data = self.corrupt_continuous(x0, alpha, sigma)
+        cond_t = self._get_noise_conditioning(tau_t, alpha, gamma)
+        f = self.forward(x_t, cond_t)
+
+        if self.train_loss == 'ce':
+            with torch.no_grad():
+                _ = self._l2_loss(target_data, f, vlb_weight, stage)
+            loss = self._ce_loss(target_data, f, vlb_weight, stage)
+        elif self.train_loss == 'l2':
+            with torch.no_grad():
+                _ = self._ce_loss(target_data, f, vlb_weight, stage)
+            loss = self._l2_loss(target_data, f, vlb_weight, stage)
+        else:
+            raise NotImplementedError(f"Train loss {self.train_loss} not implemented!")
+        self.log('loss', loss.mean(), prog_bar=True)
+        if not self.training or self.train_on_weighted_loss:
+            loss = loss * vlb_weight
+            self.log('loss_weighted', loss.mean(), prog_bar=True)
+        return loss
+
     
 class FMLM(FLMBase):
     def __init__(self, config, tokenizer):
