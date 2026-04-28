@@ -1073,6 +1073,7 @@ def get_dataloaders(config, tokenizer, skip_train=False,
             batch_size=config.loader.eval_batch_size,
             num_workers=config.loader.num_workers,
             pin_memory=config.loader.pin_memory,
+            drop_last=config.loader.drop_last_valid,
             shuffle=shuffle_valid,
             generator=generator)
         # Will be used in generative perplexity calculation

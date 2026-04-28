@@ -1362,9 +1362,9 @@ class FLMVDM(FLM):
                 curve_table, 'tau', 'alpha', title=f'{prefix}/alpha'),
             f'{prefix}/sigma_curve': wandb.plot.line(
                 curve_table, 'tau', 'sigma', title=f'{prefix}/sigma'),
-            f'{prefix}/log_snr_prime_curve': wandb.plot.line(
-                curve_table, 'tau', 'log_snr_prime',
-                title=f'{prefix}/log_snr_prime'),
+            f'{prefix}/snr_prime_curve': wandb.plot.line(
+                curve_table, 'tau', 'snr_prime',
+                title=f'{prefix}/snr_prime'),
             f'{prefix}/slope_curve': wandb.plot.line(
                 slope_table, 'tau', 'slope', title=f'{prefix}/slope'),
         }, step=int(self.global_step))

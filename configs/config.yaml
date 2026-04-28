@@ -25,6 +25,7 @@ loader:
   eval_batch_size: ${div_up:${.eval_global_batch_size}, ${eval:${trainer.devices} * ${trainer.num_nodes}}}
   num_workers: 1
   pin_memory: True
+  drop_last_valid: False
 
 sampling:
   predictor: ancestral  # ancestral_cache (only for MDLM), ancestral, analytic
