@@ -19,6 +19,9 @@ latent_type: vp  # vp, linear_interp
 cond_t: gamma  # tau, alpha, signal, gamma, log_nsr, nsr, log_snr, snr
 train_loss: ce  # ce, l2
 train_on_weighted_loss: False
+recon_loss_enabled: False
+train_on_recon_loss: False
+recon_loss_weight: 0.1
 importance_sampling: ${training.importance_sampling}
 
 schedule:

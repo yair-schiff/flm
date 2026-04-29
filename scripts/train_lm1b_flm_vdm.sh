@@ -43,6 +43,9 @@ LATENT_TYPE="${LATENT_TYPE:-vp}"
 COND_T="${COND_T:-gamma}"
 TRAIN_LOSS="${TRAIN_LOSS:-ce}"
 TRAIN_ON_WEIGHTED_LOSS="${TRAIN_ON_WEIGHTED_LOSS:-True}"
+RECON_LOSS_ENABLED="${RECON_LOSS_ENABLED:-False}"
+TRAIN_ON_RECON_LOSS="${TRAIN_ON_RECON_LOSS:-False}"
+RECON_LOSS_WEIGHT="${RECON_LOSS_WEIGHT:-1.0}"
 DOUBLE_TEMB="${DOUBLE_TEMB:-False}"
 
 GAMMA_MIN="${GAMMA_MIN:--13.3}"
@@ -55,8 +58,8 @@ ARGMAX_N_POINTS="${ARGMAX_N_POINTS:-10000}"
 ARGMAX_N_GH="${ARGMAX_N_GH:-100}"
 
 CHECKPOINT_EVERY_N_STEPS="${CHECKPOINT_EVERY_N_STEPS:-20000}"
-CHECKPOINT_MONITOR="${CHECKPOINT_MONITOR:-val_objective/ce_unweighted}"
-CHECKPOINT_FILENAME="${CHECKPOINT_FILENAME:-best_ce_unweighted}"
+CHECKPOINT_MONITOR="${CHECKPOINT_MONITOR:-val_objective/ce_weighted}"
+CHECKPOINT_FILENAME="${CHECKPOINT_FILENAME:-best_ce_weighted}"
 
 cd "${REPO_ROOT}" || exit
 source "${REPO_ROOT}/setup_env.sh" || exit
@@ -101,6 +104,9 @@ torchrun --nnodes=$NUM_NODES --nproc_per_node=$NPROC --master_port=$MASTER_PORT 
   algo.cond_t=${COND_T} \
   algo.train_loss=${TRAIN_LOSS} \
   algo.train_on_weighted_loss=${TRAIN_ON_WEIGHTED_LOSS} \
+  algo.recon_loss_enabled=${RECON_LOSS_ENABLED} \
+  algo.train_on_recon_loss=${TRAIN_ON_RECON_LOSS} \
+  algo.recon_loss_weight=${RECON_LOSS_WEIGHT} \
   algo.schedule.type=${SCHEDULE_TYPE} \
   algo.schedule.gamma_min=${GAMMA_MIN} \
   algo.schedule.gamma_max=${GAMMA_MAX} \

@@ -841,6 +841,17 @@ class FLMBase(trainer_base.TrainerBase):
         nlls = (loss * valid_tokens).sum()
         num_tokens = valid_tokens.sum()
         token_nll = nlls / num_tokens
+        loss_with_recon = getattr(self, '_nll_with_recon_loss', None)
+        if loss_with_recon is not None:
+            stage = 'train' if self.training else 'val'
+            nlls_with_recon = (loss_with_recon * valid_tokens).sum()
+            token_nll_with_recon = nlls_with_recon / num_tokens
+            self.log(f'{stage}/nll_with_recon',
+                     token_nll_with_recon.detach(),
+                     on_step=self.training,
+                     on_epoch=not self.training,
+                     sync_dist=True)
+            self._nll_with_recon_loss = None
         return trainer_base.Loss(loss=token_nll,
                                  nlls=nlls,
                                  prior_loss=0.0,
@@ -1095,6 +1106,13 @@ class FLMVDM(FLM):
         self.cond_t = getattr(config.algo, 'cond_t', 'gamma')
         self.train_loss = getattr(config.algo, 'train_loss', 'ce')
         self.train_on_weighted_loss = getattr(config.algo, 'train_on_weighted_loss', False)
+        self.train_on_recon_loss = bool(getattr(
+            config.algo, 'train_on_recon_loss', False))
+        self.recon_loss_enabled = (
+            bool(getattr(config.algo, 'recon_loss_enabled', False))
+            or self.train_on_recon_loss)
+        self.recon_loss_weight = float(getattr(
+            config.algo, 'recon_loss_weight', 0.1))
         self.schedule_cfg = getattr(config.algo, 'schedule', None)
         self.schedule_type = self._schedule_get(
             'type', getattr(config.algo, 'noise_schedule', 'linear'))
@@ -1229,8 +1247,11 @@ class FLMVDM(FLM):
             return torch.exp(-gamma)
         raise ValueError(f"Unknown cond_t: {self.cond_t}")
 
+    def _ce_values(self, target_data, log_softmax_pred):
+        return -(target_data * log_softmax_pred).sum(dim=-1)
+
     def _ce_loss(self, target_data, log_softmax_pred, vlb_weight, stage):
-        loss = -(target_data * log_softmax_pred).sum(dim=-1)
+        loss = self._ce_values(target_data, log_softmax_pred)
         self._log_stage_metric(stage, 'ce_unweighted',
                                loss.mean().detach(),
                                group='objective')
@@ -1377,10 +1398,29 @@ class FLMVDM(FLM):
         x_t = sigma * noise + alpha * target_data
         return x_t, target_data
 
+    def _endpoint_recon_loss(self, x0, stage):
+        tau_recon = torch.full((x0.shape[0],), self._t_max,
+                               device=self.device)
+        alpha, sigma, gamma, _, tau_for_cond = self._noise_variables(
+            tau_recon)
+        x_t, target_data = self.corrupt_continuous(x0, alpha, sigma)
+        cond_t = self._get_noise_conditioning(tau_for_cond, alpha, gamma)
+        f = self.forward(x_t, cond_t)
+        recon_loss = self._ce_values(target_data, f)
+        recon_mean = recon_loss.mean()
+        self._log_stage_metric(stage, 'recon_ce',
+                               recon_mean.detach(), group='objective')
+        self._log_stage_metric(
+            stage, 'recon_ce_objective',
+            (self.recon_loss_weight * recon_mean).detach(),
+            group='objective')
+        return recon_loss
+
     def loss(self, x0, output_tokens,
             current_accumulation_step=None, train_mode=False,
             xT=None, given_t=None, not_sampling_t=False):
         del given_t, not_sampling_t, output_tokens
+        self._nll_with_recon_loss = None
         stage = 'train' if self.training else 'val'
         B = x0.shape[0]
         tau_t = self._sample_t_interval(B, current_accumulation_step,
@@ -1408,6 +1448,17 @@ class FLMVDM(FLM):
         if not self.training or self.train_on_weighted_loss:
             loss = loss * vlb_weight
             self.log('loss_weighted', loss.mean(), prog_bar=True)
+        if self.recon_loss_enabled:
+            if self.training and self.train_on_recon_loss:
+                recon_loss = self._endpoint_recon_loss(x0, stage)
+                loss = loss + self.recon_loss_weight * recon_loss
+                self._nll_with_recon_loss = loss.detach()
+                self.log('loss_with_recon', loss.mean(), prog_bar=True)
+            else:
+                with torch.no_grad():
+                    recon_loss = self._endpoint_recon_loss(x0, stage)
+                self._nll_with_recon_loss = (
+                    loss.detach() + self.recon_loss_weight * recon_loss)
         return loss
 
     @torch.no_grad()
