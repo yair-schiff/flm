@@ -789,6 +789,9 @@ class FLMBase(trainer_base.TrainerBase):
         super().__init__(config, tokenizer)
         self.t_min = config.algo.t_min
         self.t_max = config.algo.t_max
+        self.val_mc_samples = int(getattr(config.algo, 'val_mc_samples', 1))
+        if self.val_mc_samples < 1:
+            raise ValueError("algo.val_mc_samples must be >= 1")
         self.lut_a2g, self.lut_g2a = utils.build_luts(K=self.vocab_size)
         self._is_resuming = (
             config.checkpointing.resume_from_ckpt
@@ -829,11 +832,41 @@ class FLMBase(trainer_base.TrainerBase):
         """Override to always dispatch to self.loss() for all FLM classes."""
         (input_tokens, output_tokens,
          valid_tokens) = self._process_model_input(x0, valid_tokens)
-        loss = self.loss(input_tokens, output_tokens,
-                         current_accumulation_step, train_mode,
-                         xT=xT, given_t=given_t,
-                         not_sampling_t=not_sampling_t)
+        mc_samples = self.val_mc_samples if not self.training else 1
+
+        def _repeat_mc(tensor):
+            if tensor is None:
+                return None
+            expanded = tensor.unsqueeze(0).expand(
+                mc_samples, *tensor.shape)
+            return expanded.reshape(
+                mc_samples * tensor.shape[0], *tensor.shape[1:])
+
+        if mc_samples > 1:
+            batch_size = input_tokens.shape[0]
+            input_tokens = _repeat_mc(input_tokens)
+            output_tokens = _repeat_mc(output_tokens)
+            xT = _repeat_mc(xT)
+            given_t = _repeat_mc(given_t)
+
+        if mc_samples > 1:
+            self._validation_mc_batch_shape = (mc_samples, batch_size)
+        try:
+            loss = self.loss(input_tokens, output_tokens,
+                             current_accumulation_step, train_mode,
+                             xT=xT, given_t=given_t,
+                             not_sampling_t=not_sampling_t)
+        finally:
+            if mc_samples > 1:
+                self._validation_mc_batch_shape = None
         assert loss.ndim == 2
+        if mc_samples > 1:
+            loss = loss.reshape(mc_samples, batch_size, *loss.shape[1:]).mean(0)
+            loss_with_recon = getattr(self, '_nll_with_recon_loss', None)
+            if loss_with_recon is not None:
+                assert loss_with_recon.ndim == 2
+                self._nll_with_recon_loss = loss_with_recon.reshape(
+                    mc_samples, batch_size, *loss_with_recon.shape[1:]).mean(0)
         if self.ignore_bos:
             loss[:, 1:] = loss[:, 1:]
             valid_tokens[:, 1:] = valid_tokens[:, 1:]
@@ -874,12 +907,26 @@ class FLMBase(trainer_base.TrainerBase):
         if accum_step is not None:
             batch_dim = n
             n = self.config.loader.global_batch_size
-        _eps_t = torch.rand(n, device=self.device)
-        if self.antithetic_sampling:
-            offset = torch.arange(n, device=self.device) / n
-            _eps_t = (_eps_t / n + offset) % 1
-            perm = torch.randperm(n, device=self.device)
-            _eps_t = _eps_t[perm]
+        mc_batch_shape = getattr(self, '_validation_mc_batch_shape', None)
+        if mc_batch_shape is not None and accum_step is None:
+            mc_samples, batch_dim = mc_batch_shape
+            assert n == mc_samples * batch_dim
+            _eps_t = torch.rand(mc_samples, batch_dim, device=self.device)
+            if self.antithetic_sampling:
+                offset = torch.arange(
+                    mc_samples, device=self.device)[:, None] / mc_samples
+                _eps_t = (_eps_t / mc_samples + offset) % 1
+                perm = torch.rand(
+                    mc_samples, batch_dim, device=self.device).argsort(dim=0)
+                _eps_t = _eps_t.gather(0, perm)
+            _eps_t = _eps_t.reshape(n)
+        else:
+            _eps_t = torch.rand(n, device=self.device)
+            if self.antithetic_sampling:
+                offset = torch.arange(n, device=self.device) / n
+                _eps_t = (_eps_t / n + offset) % 1
+                perm = torch.randperm(n, device=self.device)
+                _eps_t = _eps_t[perm]
         t = (t_max - t_min) * _eps_t + t_min
         if accum_step is not None:
             t = t.chunk(self.trainer.num_nodes)[self.trainer.node_rank]
@@ -1044,24 +1091,101 @@ class FLMBase(trainer_base.TrainerBase):
 
 
 class FLM(FLMBase):
+
+    def _d_tau_by_d_t(self, t):
+        return utils.d_alpha_by_d_gamma(t, self.lut_g2a)
+
+    @staticmethod
+    def _t_from_snr(snr):
+        sqrt_snr = torch.sqrt(snr)
+        return sqrt_snr / (1.0 + sqrt_snr)
+
+    @staticmethod
+    def _t_from_logsnr(logsnr):
+        return torch.sigmoid(0.5 * logsnr)
+
+    @staticmethod
+    def prior_kl_linear_interp(x0_onehot, t_min):
+        d = x0_onehot[0].numel()
+        mu_sq = (t_min ** 2) * (x0_onehot ** 2).sum(dim=(1, 2))
+        var = (1.0 - t_min) ** 2
+        return 0.5 * (d * var + mu_sq - d - d * torch.log(var))
+
     def loss(self, x0, output_tokens,
              current_accumulation_step=None, train_mode=False,
              xT=None, given_t=None, not_sampling_t=False):
         del given_t, not_sampling_t, output_tokens
         B = x0.shape[0]
-        tau_t = self._sample_t_interval(B, current_accumulation_step,
-                                    t_min=self.t_min, t_max=self.t_max)
-        t = self._tau_to_t(tau_t)
+        
+        # Diffusion Loss
+        u = self._sample_t_interval(B, current_accumulation_step,
+                                    t_min=0.0, t_max=1.0)        
+        # Uniform SNR sampling
+        # SNR_MIN = 0.
+        # SNR_MAX = 50.
+        # snr = SNR_MIN + u * (SNR_MAX - SNR_MIN)
+        # diff_loss_weight = SNR_MAX - SNR_MIN
+        # t = self._t_from_snr(snr)
+
+        # Uniform log-SNR sampling
+        LOG_SNR_MIN = -15.
+        LOG_SNR_MAX = 5.
+        logsnr = LOG_SNR_MIN + u * (LOG_SNR_MAX - LOG_SNR_MIN)
+        diff_loss_weight = LOG_SNR_MAX - LOG_SNR_MIN * torch.exp(logsnr)
+        t = self._t_from_logsnr(logsnr)
+
+        tau = self._t_to_tau(t)
         x_t, target_data = self.corrupt_continuous(x0, t)
-        f = self.forward(x_t, tau_t) #condition on tau_t
-        loss = -(target_data * f).sum(dim=-1)
-        self.log('loss', loss.mean(), prog_bar=True)
-        if self.config.algo.learnable_loss_weighting is True:
-            loss_weight = self.backbone.learnable_loss_weighting(tau_t)
-            loss_weight = loss_weight.unsqueeze(-1)
-            loss = torch.exp(-loss_weight) * loss + loss_weight
-            self.log('loss_weighted', loss.mean(), prog_bar=True)
+        f = self.forward(x_t, tau) #condition on tau_t
+        denoise_loss = ((target_data - f.exp())**2).sum(dim=-1)
+        diff_loss = 0.5 * diff_loss_weight[:, None] * denoise_loss
+        self.log('diff_loss', diff_loss.mean(), prog_bar=True)
+
+        # Recon Loss
+        # t_rec = self._t_from_snr(torch.full((B,), SNR_MAX, device=self.device))  # Uniform SNR sampling
+        t_rec = self._t_from_logsnr(torch.full((B,), LOG_SNR_MAX, device=self.device))  # Uniform log-SNR sampling
+        tau_rec = self._t_to_tau(t_rec)
+        x_rec, _ = self.corrupt_continuous(x0, t_rec)
+        logits_rec = self.forward(x_rec, tau_rec)
+        recon_loss = F.cross_entropy(
+            logits_rec.view(-1, self.vocab_size),
+            x0.view(-1),
+            reduction="none",
+        ).view(B, -1)
+        self.log('recon_loss', recon_loss.mean(), prog_bar=True)
+
+        # Prior Loss
+        # t_prior = self._t_from_snr(torch.full((B,), SNR_MIN, device=self.device))  # Uniform SNR sampling
+        t_prior = self._t_from_logsnr(torch.full((B,), LOG_SNR_MIN, device=self.device))  # Uniform log-SNR sampling
+        prior_loss = self.prior_kl_linear_interp(target_data, t_min=t_prior)[:, None]
+        self.log('prior_loss', prior_loss.mean(), prog_bar=True)
+
+        loss = diff_loss + recon_loss + prior_loss
+        self.log('total_loss', loss.mean(), prog_bar=True)
         return loss
+
+        # tau_t = self._sample_t_interval(B, current_accumulation_step,
+        #                             t_min=self.t_min, t_max=self.t_max)
+        # t = self._tau_to_t(tau_t)
+        # x_t, target_data = self.corrupt_continuous(x0, t)
+        # f = self.forward(x_t, tau_t) #condition on tau_t
+        # # loss = -(target_data * f).sum(dim=-1)
+        # loss = 0.5 * ((target_data - f.exp())**2).sum(dim=-1)
+        # self.log('loss', loss.mean(), prog_bar=True)
+        # if self.config.algo.learnable_loss_weighting is True:
+        #     loss_weight = self.backbone.learnable_loss_weighting(tau_t)
+        #     loss_weight = loss_weight.unsqueeze(-1)
+        #     loss = torch.exp(-loss_weight) * loss + loss_weight
+        #     self.log('loss_weighted', loss.mean(), prog_bar=True)
+        # SNR_MAX = 15.
+        # snr_prime = 2*t / (1 - t)**3
+        # dtau_dt = self._d_tau_by_d_t(t)
+        # vlb_weight = snr_prime / dtau_dt
+        # self.log('vlb_weight', vlb_weight.mean(), prog_bar=True)
+        # self.log('snr_prime', snr_prime.mean(), prog_bar=True)
+        # self.log('dtau_dt', dtau_dt.mean(), prog_bar=True)
+        # return loss * vlb_weight[:, None]
+        # # return loss
 
     @torch.no_grad()
     def generate_samples(self, num_samples, num_steps=None, eps=1e-5):
@@ -1305,7 +1429,8 @@ class FLMVDM(FLM):
         if self.importance_sampling:
             unit = self._unit_interval_from_tau(tau)
             tau_for_cond, gamma, vlb_weight = (
-                self.noise_schedule.importance_sample(unit, t_max=self._t_max))
+                self.noise_schedule.importance_sample(
+                    unit, t_min=self._t_min, t_max=self._t_max))
         else:
             gamma, vlb_weight = self.noise_schedule(tau)
         alpha, sigma = self._alpha_sigma_from_gamma(gamma)

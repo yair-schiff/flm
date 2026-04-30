@@ -12,6 +12,7 @@ t_max: 1.0
 t_min: 0.0
 val_t_min: ${.t_min}
 val_t_max: ${.t_max}
+val_mc_samples: 1
 double_temb: False
 learnable_loss_weighting: False
 

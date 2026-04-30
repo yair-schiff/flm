@@ -14,9 +14,9 @@
 
 checkpoint_path="/share/kuleshov/yzs2/flm-og/outputs/lm1b/lm1b_flm.ckpt"
 DATA_DIR="/share/kuleshov/yzs2/data"
-TAU_NLL_BINS="${TAU_NLL_BINS:-20}"
-TAU_NLL_TOP_K="${TAU_NLL_TOP_K:-8}"
-LIMIT_VAL_BATCHES="${LIMIT_VAL_BATCHES:-32}"
+LIMIT_VAL_BATCHES="${LIMIT_VAL_BATCHES:-1.0}"
+BATCH_SIZE="${BATCH_SIZE:-32}"
+VAL_MC_SAMPLES="${VAL_MC_SAMPLES:-1}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
@@ -28,22 +28,20 @@ export HYDRA_FULL_ERROR=1
 #srun python -u -m main \
 python -u -m main \
   mode=ppl_eval \
-  loader.batch_size=256 \
-  loader.eval_batch_size=256 \
+  loader.batch_size=${BATCH_SIZE} \
+  loader.eval_batch_size=${BATCH_SIZE} \
   loader.num_workers=0 \
   data=lm1b-wrap \
   data.cache_dir=$DATA_DIR \
   model=small \
   model.length=128 \
   algo=flm \
-  algo.t_min=0.1 \
-  algo.t_max=0.9 \
-  algo.track_tau_nll=true \
-  algo.tau_nll_bins=$TAU_NLL_BINS \
-  algo.tau_nll_top_k=$TAU_NLL_TOP_K \
+  algo.t_min=0.0 \
+  algo.t_max=0.999 \
   eval.checkpoint_path=$checkpoint_path \
   trainer.limit_val_batches=$LIMIT_VAL_BATCHES \
   sampling.num_sample_batches=0 \
   eval.generate_samples=false \
   eval.compute_generative_perplexity=false \
-  +wandb.offline=true
+  +wandb.offline=true \
+  algo.val_mc_samples=${VAL_MC_SAMPLES}

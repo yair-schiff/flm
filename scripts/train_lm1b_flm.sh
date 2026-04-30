@@ -16,6 +16,7 @@ export NCCL_P2P_LEVEL=NVL
 
 export MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
 export MASTER_PORT="${MASTER_PORT:-25001}"
+VAL_MC_SAMPLES="${VAL_MC_SAMPLES:-1}"
 
 # Node settings
 export NUM_NODES="${SLURM_JOB_NUM_NODES:-1}"
@@ -41,4 +42,5 @@ torchrun --nnodes=$NUM_NODES --nproc_per_node=$NPROC --master_port=$MASTER_PORT 
   optim.lr=3e-4 \
   trainer.val_check_interval=5000 \
   algo.double_temb=False \
+  algo.val_mc_samples=${VAL_MC_SAMPLES} \
   callbacks.checkpoint_every_n_steps.every_n_train_steps=20000

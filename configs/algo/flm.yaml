@@ -10,5 +10,6 @@ causal_attention: False
 ignore_bos: False
 t_max: 1.0
 t_min: 0.0
+val_mc_samples: 1
 double_temb: False
 learnable_loss_weighting: False

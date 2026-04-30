@@ -51,12 +51,14 @@ class BaseNoiseSchedule(torch.nn.Module):
             hi = torch.where(mid_snr >= target, mid, hi)
         return 0.5 * (lo + hi)
 
-    def importance_sample(self, unit, t_max=1.0):
+    def importance_sample(self, unit, t_min=0.0, t_max=1.0):
+        snr_min = self.snr_at(t_min, unit).clamp_min(self._eps_like(unit))
         snr_max = self.snr_at(t_max, unit).clamp_min(self._eps_like(unit))
-        snr = (unit * snr_max).clamp_min(self._eps_like(unit))
+        snr_span = (snr_max - snr_min).clamp_min(self._eps_like(unit))
+        snr = (snr_min + unit * snr_span).clamp_min(self._eps_like(unit))
         gamma = -torch.log(snr)
         tau = self.tau_from_snr(snr)
-        vlb_weight = torch.ones_like(unit) * snr_max
+        vlb_weight = torch.ones_like(unit) * snr_span
         return tau, gamma, vlb_weight
 
 
