@@ -23,6 +23,9 @@ train_on_weighted_loss: False
 recon_loss_enabled: False
 train_on_recon_loss: False
 recon_loss_weight: 0.1
+prior_loss_enabled: False
+train_on_prior_loss: False
+prior_loss_weight: 1.0
 importance_sampling: ${training.importance_sampling}
 
 schedule:

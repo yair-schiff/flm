@@ -862,11 +862,17 @@ class FLMBase(trainer_base.TrainerBase):
         assert loss.ndim == 2
         if mc_samples > 1:
             loss = loss.reshape(mc_samples, batch_size, *loss.shape[1:]).mean(0)
-            loss_with_recon = getattr(self, '_nll_with_recon_loss', None)
-            if loss_with_recon is not None:
-                assert loss_with_recon.ndim == 2
-                self._nll_with_recon_loss = loss_with_recon.reshape(
-                    mc_samples, batch_size, *loss_with_recon.shape[1:]).mean(0)
+            for attr_name in (
+                    '_nll_with_recon_loss',
+                    '_nll_with_prior_loss',
+                    '_nll_with_elbo_loss',
+                    '_prior_token_loss'):
+                attr_value = getattr(self, attr_name, None)
+                if attr_value is not None:
+                    assert attr_value.ndim == 2
+                    setattr(self, attr_name, attr_value.reshape(
+                        mc_samples, batch_size,
+                        *attr_value.shape[1:]).mean(0))
         if self.ignore_bos:
             loss[:, 1:] = loss[:, 1:]
             valid_tokens[:, 1:] = valid_tokens[:, 1:]
@@ -874,20 +880,31 @@ class FLMBase(trainer_base.TrainerBase):
         nlls = (loss * valid_tokens).sum()
         num_tokens = valid_tokens.sum()
         token_nll = nlls / num_tokens
-        loss_with_recon = getattr(self, '_nll_with_recon_loss', None)
-        if loss_with_recon is not None:
+        for metric_suffix, attr_name in (
+                ('recon', '_nll_with_recon_loss'),
+                ('prior', '_nll_with_prior_loss'),
+                ('elbo', '_nll_with_elbo_loss')):
+            side_loss = getattr(self, attr_name, None)
+            if side_loss is None:
+                continue
             stage = 'train' if self.training else 'val'
-            nlls_with_recon = (loss_with_recon * valid_tokens).sum()
-            token_nll_with_recon = nlls_with_recon / num_tokens
-            self.log(f'{stage}/nll_with_recon',
-                     token_nll_with_recon.detach(),
+            side_nlls = (side_loss * valid_tokens).sum()
+            side_token_nll = side_nlls / num_tokens
+            self.log(f'{stage}/nll_with_{metric_suffix}',
+                     side_token_nll.detach(),
                      on_step=self.training,
                      on_epoch=not self.training,
                      sync_dist=True)
-            self._nll_with_recon_loss = None
+            setattr(self, attr_name, None)
+        prior_token_loss = getattr(self, '_prior_token_loss', None)
+        if prior_token_loss is not None:
+            prior_loss = (prior_token_loss * valid_tokens).sum()
+            self._prior_token_loss = None
+        else:
+            prior_loss = loss.new_tensor(0.0)
         return trainer_base.Loss(loss=token_nll,
                                  nlls=nlls,
-                                 prior_loss=0.0,
+                                 prior_loss=prior_loss.detach(),
                                  num_tokens=num_tokens)
 
     def loss(self, x0, output_tokens,
@@ -1652,6 +1669,13 @@ class FLMVDM(FLM):
             or self.train_on_recon_loss)
         self.recon_loss_weight = float(getattr(
             config.algo, 'recon_loss_weight', 0.1))
+        self.train_on_prior_loss = bool(getattr(
+            config.algo, 'train_on_prior_loss', False))
+        self.prior_loss_enabled = (
+            bool(getattr(config.algo, 'prior_loss_enabled', False))
+            or self.train_on_prior_loss)
+        self.prior_loss_weight = float(getattr(
+            config.algo, 'prior_loss_weight', 1.0))
         self.schedule_cfg = getattr(config.algo, 'schedule', None)
         self.schedule_type = self._schedule_get(
             'type', getattr(config.algo, 'noise_schedule', 'linear'))
@@ -1956,11 +1980,34 @@ class FLMVDM(FLM):
             group='objective')
         return recon_loss
 
+    def _endpoint_prior_loss(self, x0, stage):
+        tau_prior = torch.full((x0.shape[0],), self._t_min,
+                               device=self.device)
+        gamma = self.noise_schedule.gamma(tau_prior)
+        alpha, sigma = self._alpha_sigma_from_gamma(gamma)
+        alpha_sq = alpha.float().square().view(-1, 1)
+        var = sigma.float().square().clamp_min(1e-30).view(-1, 1)
+        prior_loss = 0.5 * (
+            alpha_sq
+            + self.vocab_size * (var - torch.log(var) - 1.0))
+        prior_loss = prior_loss.expand(-1, x0.shape[1])
+        prior_mean = prior_loss.mean()
+        self._log_stage_metric(stage, 'prior_kl',
+                               prior_mean.detach(), group='objective')
+        self._log_stage_metric(
+            stage, 'prior_kl_objective',
+            (self.prior_loss_weight * prior_mean).detach(),
+            group='objective')
+        return prior_loss
+
     def loss(self, x0, output_tokens,
             current_accumulation_step=None, train_mode=False,
             xT=None, given_t=None, not_sampling_t=False):
         del given_t, not_sampling_t, output_tokens
         self._nll_with_recon_loss = None
+        self._nll_with_prior_loss = None
+        self._nll_with_elbo_loss = None
+        self._prior_token_loss = None
         stage = 'train' if self.training else 'val'
         B = x0.shape[0]
         tau_t = self._sample_t_interval(B, current_accumulation_step,
@@ -1988,17 +2035,42 @@ class FLMVDM(FLM):
         if not self.training or self.train_on_weighted_loss:
             loss = loss * vlb_weight
             self.log('loss_weighted', loss.mean(), prog_bar=True)
+        diff_loss_for_reporting = loss.detach()
+        elbo_loss_for_reporting = diff_loss_for_reporting
         if self.recon_loss_enabled:
             if self.training and self.train_on_recon_loss:
                 recon_loss = self._endpoint_recon_loss(x0, stage)
-                loss = loss + self.recon_loss_weight * recon_loss
+                recon_term = self.recon_loss_weight * recon_loss
+                loss = loss + recon_term
                 self._nll_with_recon_loss = loss.detach()
                 self.log('loss_with_recon', loss.mean(), prog_bar=True)
             else:
                 with torch.no_grad():
                     recon_loss = self._endpoint_recon_loss(x0, stage)
+                recon_term = self.recon_loss_weight * recon_loss
                 self._nll_with_recon_loss = (
-                    loss.detach() + self.recon_loss_weight * recon_loss)
+                    diff_loss_for_reporting + recon_term.detach())
+            elbo_loss_for_reporting = (
+                elbo_loss_for_reporting + recon_term.detach())
+        if self.prior_loss_enabled:
+            if self.training and self.train_on_prior_loss:
+                prior_loss = self._endpoint_prior_loss(x0, stage)
+                prior_term = self.prior_loss_weight * prior_loss
+                loss = loss + prior_term
+                self._nll_with_prior_loss = (
+                    diff_loss_for_reporting + prior_term.detach())
+                self.log('loss_with_prior', loss.mean(), prog_bar=True)
+            else:
+                with torch.no_grad():
+                    prior_loss = self._endpoint_prior_loss(x0, stage)
+                prior_term = self.prior_loss_weight * prior_loss
+                self._nll_with_prior_loss = (
+                    diff_loss_for_reporting + prior_term.detach())
+            self._prior_token_loss = prior_loss.detach()
+            elbo_loss_for_reporting = (
+                elbo_loss_for_reporting + prior_term.detach())
+        if self.recon_loss_enabled or self.prior_loss_enabled:
+            self._nll_with_elbo_loss = elbo_loss_for_reporting
         return loss
 
     @torch.no_grad()

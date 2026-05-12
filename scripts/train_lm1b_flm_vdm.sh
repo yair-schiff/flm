@@ -46,6 +46,9 @@ TRAIN_ON_WEIGHTED_LOSS="${TRAIN_ON_WEIGHTED_LOSS:-True}"
 RECON_LOSS_ENABLED="${RECON_LOSS_ENABLED:-False}"
 TRAIN_ON_RECON_LOSS="${TRAIN_ON_RECON_LOSS:-False}"
 RECON_LOSS_WEIGHT="${RECON_LOSS_WEIGHT:-1.0}"
+PRIOR_LOSS_ENABLED="${PRIOR_LOSS_ENABLED:-False}"
+TRAIN_ON_PRIOR_LOSS="${TRAIN_ON_PRIOR_LOSS:-False}"
+PRIOR_LOSS_WEIGHT="${PRIOR_LOSS_WEIGHT:-1.0}"
 DOUBLE_TEMB="${DOUBLE_TEMB:-False}"
 VAL_MC_SAMPLES="${VAL_MC_SAMPLES:-1}"
 
@@ -108,6 +111,9 @@ torchrun --nnodes=$NUM_NODES --nproc_per_node=$NPROC --master_port=$MASTER_PORT 
   algo.recon_loss_enabled=${RECON_LOSS_ENABLED} \
   algo.train_on_recon_loss=${TRAIN_ON_RECON_LOSS} \
   algo.recon_loss_weight=${RECON_LOSS_WEIGHT} \
+  algo.prior_loss_enabled=${PRIOR_LOSS_ENABLED} \
+  algo.train_on_prior_loss=${TRAIN_ON_PRIOR_LOSS} \
+  algo.prior_loss_weight=${PRIOR_LOSS_WEIGHT} \
   algo.val_mc_samples=${VAL_MC_SAMPLES} \
   algo.schedule.type=${SCHEDULE_TYPE} \
   algo.schedule.gamma_min=${GAMMA_MIN} \
