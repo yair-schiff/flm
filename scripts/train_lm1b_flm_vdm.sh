@@ -19,7 +19,7 @@ export TORCHINDUCTOR_CACHE_DIR
 DATA_DIR="${DATA_DIR:-/share/kuleshov/yzs2/data}"
 REPO_ROOT="${FLM_REPO_ROOT:-/share/kuleshov/yzs2/flm-og}"
 
-SCHEDULE_TYPE="${SCHEDULE_TYPE:-snr_power}"  # linear, learned_vdm, argmax_uncertainty, snr_power
+SCHEDULE_TYPE="${SCHEDULE_TYPE:-argmax_uncertainty}"  # linear, learned_vdm, argmax_uncertainty, snr_power
 IMPORTANCE_SAMPLING="${IMPORTANCE_SAMPLING:-False}"
 RUN_NAME="${RUN_NAME:-lm1b_full_flm_vdm_${SCHEDULE_TYPE}}"
 
@@ -59,8 +59,8 @@ ARGMAX_N_POINTS="${ARGMAX_N_POINTS:-10000}"
 ARGMAX_N_GH="${ARGMAX_N_GH:-100}"
 
 CHECKPOINT_EVERY_N_STEPS="${CHECKPOINT_EVERY_N_STEPS:-20000}"
-CHECKPOINT_MONITOR="${CHECKPOINT_MONITOR:-val_objective/ce_weighted}"
-CHECKPOINT_FILENAME="${CHECKPOINT_FILENAME:-best_ce_weighted}"
+CHECKPOINT_MONITOR="${CHECKPOINT_MONITOR:-val_objective/${TRAIN_LOSS}_weighted}"
+CHECKPOINT_FILENAME="${CHECKPOINT_FILENAME:-best_${TRAIN_LOSS}_weighted}"
 
 cd "${REPO_ROOT}" || exit
 source "${REPO_ROOT}/setup_env.sh" || exit

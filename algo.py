@@ -895,6 +895,24 @@ class FLMBase(trainer_base.TrainerBase):
              xT=None, given_t=None, not_sampling_t=False):
         raise NotImplementedError
 
+    def continuous_log_likelihood(self, *args, **kwargs):
+        del args, kwargs
+        raise NotImplementedError(
+            "continuous_log_likelihood is currently implemented only for "
+            "the base FLM algorithm with algo.name == 'flm'.")
+
+    def continuous_endpoint_log_density(self, *args, **kwargs):
+        del args, kwargs
+        raise NotImplementedError(
+            "continuous_endpoint_log_density is currently implemented only "
+            "for the base FLM algorithm with algo.name == 'flm'.")
+
+    def discrete_elbo(self, *args, **kwargs):
+        del args, kwargs
+        raise NotImplementedError(
+            "discrete_elbo is currently implemented only for the base FLM "
+            "algorithm with algo.name == 'flm'.")
+
     def nll(self, input_tokens, output_tokens,
             current_accumulation_step=None, train_mode=False):
         raise NotImplementedError
@@ -1111,81 +1129,478 @@ class FLM(FLMBase):
         var = (1.0 - t_min) ** 2
         return 0.5 * (d * var + mu_sq - d - d * torch.log(var))
 
+    def _continuous_likelihood_vector_field(self, x, t, endpoint_eps):
+        tau = self._t_to_tau(t)
+        x1_pred = self.forward(x, tau).exp()
+        denom = (1.0 - t).clamp_min(endpoint_eps).view(-1, 1, 1)
+        return (x1_pred - x) / denom
+
+    @staticmethod
+    def _standard_normal_log_prob(x):
+        dims = tuple(range(1, x.ndim))
+        log_two_pi = x.new_tensor(math.log(2.0 * math.pi))
+        return -0.5 * (x.square() + log_two_pi).sum(dim=dims)
+
+    @staticmethod
+    def _diagonal_gaussian_log_prob(x, mean, std):
+        dims = tuple(range(1, x.ndim))
+        log_norm = math.log(2.0 * math.pi) + 2.0 * math.log(float(std))
+        normalized = (x - mean) / float(std)
+        return -0.5 * (normalized.square() + log_norm).sum(dim=dims)
+
+    @staticmethod
+    def _diagonal_gaussian_entropy(batch_size, num_dims, std, device, dtype):
+        value = 0.5 * float(num_dims) * (
+            1.0 + math.log(2.0 * math.pi) + 2.0 * math.log(float(std)))
+        return torch.full((batch_size,), value, device=device, dtype=dtype)
+
+    @staticmethod
+    def _logmeanexp(x, dim=0):
+        return torch.logsumexp(x, dim=dim) - math.log(x.shape[dim])
+
+    @staticmethod
+    def _sample_likelihood_probes(shape, trace_samples, noise,
+                                  seed, device, dtype):
+        generator = None
+        if seed is not None:
+            generator = torch.Generator(device=device)
+            generator.manual_seed(int(seed))
+        probe_shape = (trace_samples, *shape)
+        if noise == 'rademacher':
+            probes = torch.randint(
+                0, 2, probe_shape, generator=generator, device=device)
+            return probes.to(dtype=dtype).mul_(2).sub_(1)
+        if noise == 'gaussian':
+            return torch.randn(
+                probe_shape, generator=generator, device=device, dtype=dtype)
+        raise ValueError(f"Unknown trace noise: {noise}")
+
+    @staticmethod
+    def _hutchinson_divergence(v, x, probes):
+        if not v.requires_grad:
+            return x.new_zeros(x.shape[0])
+        estimates = []
+        for probe_idx, probe in enumerate(probes):
+            retain_graph = probe_idx < probes.shape[0] - 1
+            grad = torch.autograd.grad(
+                (v * probe).sum(),
+                x,
+                retain_graph=retain_graph,
+                create_graph=False,
+                allow_unused=True)[0]
+            if grad is None:
+                estimates.append(x.new_zeros(x.shape[0]))
+            else:
+                estimates.append((grad * probe).flatten(1).sum(dim=1))
+        return torch.stack(estimates, dim=0).mean(dim=0)
+
+    @staticmethod
+    def _exact_divergence(v, x):
+        if not v.requires_grad:
+            return x.new_zeros(x.shape[0])
+        flat_v = v.flatten(1)
+        flat_dim = flat_v.shape[1]
+        divergence = x.new_zeros(x.shape[0])
+        for idx in range(flat_dim):
+            grad = torch.autograd.grad(
+                flat_v[:, idx].sum(),
+                x,
+                retain_graph=idx < flat_dim - 1,
+                create_graph=False,
+                allow_unused=True)[0]
+            if grad is not None:
+                divergence = divergence + grad.flatten(1)[:, idx]
+        return divergence
+
+    def _continuous_likelihood_rhs(self, x, t, trace_method,
+                                   probes, endpoint_eps):
+        t = x.new_full((x.shape[0],), float(t))
+        x = x.detach().requires_grad_(True)
+        v = self._continuous_likelihood_vector_field(x, t, endpoint_eps)
+        if trace_method == 'exact':
+            divergence = self._exact_divergence(v, x)
+        elif trace_method == 'hutchinson':
+            divergence = self._hutchinson_divergence(v, x, probes)
+        else:
+            raise ValueError(f"Unknown trace_method: {trace_method}")
+        return v.detach(), divergence.detach()
+
+    def _validate_base_flm_continuous_density(self):
+        algo_name = getattr(getattr(self.config, 'algo', None), 'name', None)
+        if algo_name != 'flm':
+            raise NotImplementedError(
+                "continuous likelihood helpers are currently implemented "
+                "only for the base FLM algorithm with algo.name == 'flm'.")
+
+    @staticmethod
+    def _validate_continuous_likelihood_args(
+            num_steps, endpoint_eps, trace_method,
+            trace_samples, solver, noise):
+        if int(num_steps) < 1:
+            raise ValueError("num_steps must be at least 1")
+        if not 0.0 < float(endpoint_eps) < 1.0:
+            raise ValueError("endpoint_eps must be in (0, 1)")
+        if trace_method not in {'hutchinson', 'exact'}:
+            raise ValueError(
+                "trace_method must be 'hutchinson' or 'exact'")
+        if int(trace_samples) < 1:
+            raise ValueError("trace_samples must be at least 1")
+        if solver not in {'euler', 'rk4'}:
+            raise ValueError("solver must be 'euler' or 'rk4'")
+        if noise not in {'rademacher', 'gaussian'}:
+            raise ValueError("noise must be 'rademacher' or 'gaussian'")
+
+    @staticmethod
+    def _validate_discrete_elbo_args(mc_samples):
+        if int(mc_samples) < 1:
+            raise ValueError("mc_samples must be at least 1")
+
+    @staticmethod
+    def _validate_endpoint_state_shape(y_endpoint, vocab_size):
+        if y_endpoint.ndim != 3:
+            raise ValueError(
+                "y_endpoint must have shape (batch, length, vocab_size)")
+        if y_endpoint.shape[-1] != vocab_size:
+            raise ValueError(
+                "y_endpoint last dimension must match model vocab_size")
+
+    @staticmethod
+    def _sample_endpoint_noise(shape, seed, device, dtype):
+        generator = None
+        if seed is not None:
+            generator = torch.Generator(device=device)
+            generator.manual_seed(int(seed))
+        return torch.randn(
+            shape, generator=generator, device=device, dtype=dtype)
+
+    def _endpoint_decoder_log_prob(self, y_endpoint, x0, endpoint_t,
+                                   endpoint_eps):
+        logits = y_endpoint * (float(endpoint_t) / (float(endpoint_eps) ** 2))
+        log_probs = logits.log_softmax(dim=-1)
+        return torch.gather(log_probs, -1, x0[..., None]).squeeze(-1).sum(dim=1)
+
+    def continuous_endpoint_log_density(
+        self,
+        y_endpoint,
+        *,
+        num_steps: int = 128,
+        endpoint_eps: float = 1e-4,
+        trace_method: str = "hutchinson",
+        trace_samples: int = 1,
+        solver: str = "rk4",
+        noise: str = "rademacher",
+        seed: int | None = None,
+        return_details: bool = False,
+    ):
+        """Estimate continuous CNF log density at endpoint time 1-endpoint_eps.
+
+        The input `y_endpoint` is a continuous state in the FLM ambient
+        one-hot space. This method returns the density of that state at the
+        same endpoint time used by the discrete helper and current sampler.
+        """
+        self._validate_base_flm_continuous_density()
+        self._validate_continuous_likelihood_args(
+            num_steps, endpoint_eps, trace_method,
+            trace_samples, solver, noise)
+        self._validate_endpoint_state_shape(y_endpoint, self.vocab_size)
+        num_steps = int(num_steps)
+        endpoint_eps = float(endpoint_eps)
+        trace_samples = int(trace_samples)
+        is_trace_exact = trace_method == 'exact'
+
+        dtype = getattr(self, 'dtype', torch.float32)
+        if not torch.empty((), dtype=dtype).is_floating_point():
+            dtype = torch.float32
+        device = getattr(self, 'device', y_endpoint.device)
+        x = y_endpoint.to(device=device, dtype=dtype).detach()
+
+        probes = None
+        if not is_trace_exact:
+            probes = self._sample_likelihood_probes(
+                x.shape, trace_samples, noise, seed, x.device, x.dtype)
+
+        was_training = self.training
+        try:
+            self.eval()
+            with torch.enable_grad():
+                t1 = 1.0 - endpoint_eps
+                h = -t1 / num_steps
+                t = t1
+                divergence_integral = x.new_zeros(x.shape[0])
+
+                for _ in range(num_steps):
+                    if solver == 'euler':
+                        v1, div1 = self._continuous_likelihood_rhs(
+                            x, t, trace_method, probes, endpoint_eps)
+                        x = (x + h * v1).detach()
+                        divergence_integral = (
+                            divergence_integral - h * div1).detach()
+                    else:
+                        v1, div1 = self._continuous_likelihood_rhs(
+                            x, t, trace_method, probes, endpoint_eps)
+                        v2, div2 = self._continuous_likelihood_rhs(
+                            x + 0.5 * h * v1, t + 0.5 * h,
+                            trace_method, probes, endpoint_eps)
+                        v3, div3 = self._continuous_likelihood_rhs(
+                            x + 0.5 * h * v2, t + 0.5 * h,
+                            trace_method, probes, endpoint_eps)
+                        v4, div4 = self._continuous_likelihood_rhs(
+                            x + h * v3, t + h,
+                            trace_method, probes, endpoint_eps)
+                        x = (x + h * (
+                            v1 + 2 * v2 + 2 * v3 + v4) / 6.0).detach()
+                        divergence_integral = (
+                            divergence_integral - h * (
+                                div1 + 2 * div2 + 2 * div3 + div4) / 6.0
+                        ).detach()
+                    t = t + h
+
+                base_log_prob = self._standard_normal_log_prob(x).detach()
+                log_prob = (base_log_prob - divergence_integral).detach()
+        finally:
+            self.train(was_training)
+
+        if not return_details:
+            return log_prob
+        return {
+            'log_prob': log_prob,
+            'nll': -log_prob,
+            'base_log_prob': base_log_prob,
+            'divergence_integral': divergence_integral.detach(),
+            'trace_method': trace_method,
+            'trace_samples': trace_samples,
+            'endpoint_eps': endpoint_eps,
+            'is_trace_exact': is_trace_exact,
+        }
+
+    def continuous_log_likelihood(
+        self,
+        x0: torch.LongTensor,
+        *,
+        num_steps: int = 128,
+        endpoint_eps: float = 1e-4,
+        trace_method: str = "hutchinson",
+        trace_samples: int = 1,
+        solver: str = "rk4",
+        noise: str = "rademacher",
+        seed: int | None = None,
+        return_details: bool = False,
+    ):
+        """Estimate continuous CNF log density for one-hot token embeddings.
+
+        This is not discrete token probability mass after argmax decoding.
+        The returned density is for the continuous state followed by the base
+        FLM ODE used by `generate_samples`.
+        """
+        self._validate_base_flm_continuous_density()
+        dtype = getattr(self, 'dtype', torch.float32)
+        if not torch.empty((), dtype=dtype).is_floating_point():
+            dtype = torch.float32
+        device = getattr(self, 'device', x0.device)
+        x0 = x0.to(device=device)
+        y_endpoint = F.one_hot(x0, self.vocab_size).to(dtype=dtype)
+        return self.continuous_endpoint_log_density(
+            y_endpoint,
+            num_steps=num_steps,
+            endpoint_eps=endpoint_eps,
+            trace_method=trace_method,
+            trace_samples=trace_samples,
+            solver=solver,
+            noise=noise,
+            seed=seed,
+            return_details=return_details,
+        )
+
+    def discrete_elbo(
+        self,
+        x0: torch.LongTensor,
+        *,
+        mc_samples: int = 1,
+        num_steps: int = 128,
+        endpoint_eps: float = 1e-2,
+        trace_method: str = "hutchinson",
+        trace_samples: int = 1,
+        solver: str = "rk4",
+        noise: str = "rademacher",
+        seed: int | None = None,
+        return_details: bool = False,
+    ):
+        """Estimate a discrete-text ELBO for base FLM via the endpoint latent.
+
+        The encoder uses the FLM forward endpoint kernel
+        q(y | x) = N((1-eps) * one_hot(x), eps^2 I), and the decoder uses the
+        corresponding Gaussian posterior classifier with a uniform token prior.
+        This produces a lower bound on log P(x), hence an upper bound on NLL
+        and PPL after token normalization.
+        """
+        self._validate_base_flm_continuous_density()
+        self._validate_continuous_likelihood_args(
+            num_steps, endpoint_eps, trace_method,
+            trace_samples, solver, noise)
+        self._validate_discrete_elbo_args(mc_samples)
+
+        mc_samples = int(mc_samples)
+        endpoint_eps = float(endpoint_eps)
+        endpoint_t = 1.0 - endpoint_eps
+        dtype = getattr(self, 'dtype', torch.float32)
+        if not torch.empty((), dtype=dtype).is_floating_point():
+            dtype = torch.float32
+        device = getattr(self, 'device', x0.device)
+        x0 = x0.to(device=device)
+        target = F.one_hot(x0, self.vocab_size).to(dtype=dtype)
+        mean = target * endpoint_t
+
+        batch_size = x0.shape[0]
+        sample_elbo_accum = x0.new_zeros(batch_size, dtype=dtype)
+        continuous_log_prob_accum = x0.new_zeros(x0.shape[0], dtype=dtype)
+        decoder_log_prob_accum = x0.new_zeros(x0.shape[0], dtype=dtype)
+        encoder_log_prob_accum = x0.new_zeros(x0.shape[0], dtype=dtype)
+        sample_log_weights = []
+
+        for sample_idx in range(mc_samples):
+            sample_seed = None if seed is None else int(seed) + sample_idx
+            y_endpoint = mean + endpoint_eps * self._sample_endpoint_noise(
+                mean.shape, sample_seed, mean.device, mean.dtype)
+            continuous_seed = (
+                None if seed is None else int(seed) + mc_samples + sample_idx)
+            continuous_details = self.continuous_endpoint_log_density(
+                y_endpoint,
+                num_steps=num_steps,
+                endpoint_eps=endpoint_eps,
+                trace_method=trace_method,
+                trace_samples=trace_samples,
+                solver=solver,
+                noise=noise,
+                seed=continuous_seed,
+                return_details=True,
+            )
+            continuous_log_prob = continuous_details['log_prob']
+            decoder_log_prob = self._endpoint_decoder_log_prob(
+                y_endpoint, x0, endpoint_t, endpoint_eps)
+            encoder_log_prob = self._diagonal_gaussian_log_prob(
+                y_endpoint, mean, endpoint_eps)
+            sample_log_weight = (
+                continuous_log_prob + decoder_log_prob - encoder_log_prob)
+
+            sample_elbo_accum = sample_elbo_accum + sample_log_weight.detach()
+            continuous_log_prob_accum = (
+                continuous_log_prob_accum + continuous_log_prob.detach())
+            decoder_log_prob_accum = (
+                decoder_log_prob_accum + decoder_log_prob.detach())
+            encoder_log_prob_accum = (
+                encoder_log_prob_accum + encoder_log_prob.detach())
+            sample_log_weights.append(sample_log_weight.detach())
+
+        sample_elbo = sample_elbo_accum / mc_samples
+        continuous_log_prob = continuous_log_prob_accum / mc_samples
+        decoder_log_prob = decoder_log_prob_accum / mc_samples
+        encoder_log_prob = encoder_log_prob_accum / mc_samples
+        encoder_entropy = self._diagonal_gaussian_entropy(
+            batch_size=batch_size,
+            num_dims=mean[0].numel(),
+            std=endpoint_eps,
+            device=mean.device,
+            dtype=mean.dtype)
+        elbo = continuous_log_prob + decoder_log_prob + encoder_entropy
+        iw_elbo = self._logmeanexp(torch.stack(sample_log_weights, dim=0), dim=0)
+        nll_upper_bound = -elbo
+        sample_nll_upper_bound = -sample_elbo
+        iw_nll_upper_bound = -iw_elbo
+
+        if not return_details:
+            return elbo
+        return {
+            'elbo': elbo,
+            'sample_elbo': sample_elbo,
+            'iw_elbo': iw_elbo,
+            'continuous_log_prob': continuous_log_prob,
+            'decoder_log_prob': decoder_log_prob,
+            'encoder_log_prob': encoder_log_prob,
+            'encoder_entropy': encoder_entropy,
+            'nll_upper_bound': nll_upper_bound,
+            'sample_nll_upper_bound': sample_nll_upper_bound,
+            'iw_nll_upper_bound': iw_nll_upper_bound,
+            'trace_method': trace_method,
+            'trace_samples': int(trace_samples),
+            'endpoint_eps': endpoint_eps,
+            'mc_samples': mc_samples,
+            'solver': solver,
+        }
+
     def loss(self, x0, output_tokens,
              current_accumulation_step=None, train_mode=False,
              xT=None, given_t=None, not_sampling_t=False):
         del given_t, not_sampling_t, output_tokens
         B = x0.shape[0]
         
-        # Diffusion Loss
-        u = self._sample_t_interval(B, current_accumulation_step,
-                                    t_min=0.0, t_max=1.0)        
-        # Uniform SNR sampling
-        # SNR_MIN = 0.
-        # SNR_MAX = 50.
-        # snr = SNR_MIN + u * (SNR_MAX - SNR_MIN)
-        # diff_loss_weight = SNR_MAX - SNR_MIN
-        # t = self._t_from_snr(snr)
+        # # Diffusion Loss
+        # u = self._sample_t_interval(B, current_accumulation_step,
+        #                             t_min=0.0, t_max=1.0)        
+        # # Uniform SNR sampling
+        # # SNR_MIN = 0.
+        # # SNR_MAX = 50.
+        # # snr = SNR_MIN + u * (SNR_MAX - SNR_MIN)
+        # # diff_loss_weight = SNR_MAX - SNR_MIN
+        # # t = self._t_from_snr(snr)
 
-        # Uniform log-SNR sampling
-        LOG_SNR_MIN = -15.
-        LOG_SNR_MAX = 5.
-        logsnr = LOG_SNR_MIN + u * (LOG_SNR_MAX - LOG_SNR_MIN)
-        diff_loss_weight = LOG_SNR_MAX - LOG_SNR_MIN * torch.exp(logsnr)
-        t = self._t_from_logsnr(logsnr)
+        # # Uniform log-SNR sampling
+        # LOG_SNR_MIN = -15.
+        # LOG_SNR_MAX = 5.
+        # logsnr = LOG_SNR_MIN + u * (LOG_SNR_MAX - LOG_SNR_MIN)
+        # diff_loss_weight = LOG_SNR_MAX - LOG_SNR_MIN * torch.exp(logsnr)
+        # t = self._t_from_logsnr(logsnr)
 
-        tau = self._t_to_tau(t)
-        x_t, target_data = self.corrupt_continuous(x0, t)
-        f = self.forward(x_t, tau) #condition on tau_t
-        denoise_loss = ((target_data - f.exp())**2).sum(dim=-1)
-        diff_loss = 0.5 * diff_loss_weight[:, None] * denoise_loss
-        self.log('diff_loss', diff_loss.mean(), prog_bar=True)
-
-        # Recon Loss
-        # t_rec = self._t_from_snr(torch.full((B,), SNR_MAX, device=self.device))  # Uniform SNR sampling
-        t_rec = self._t_from_logsnr(torch.full((B,), LOG_SNR_MAX, device=self.device))  # Uniform log-SNR sampling
-        tau_rec = self._t_to_tau(t_rec)
-        x_rec, _ = self.corrupt_continuous(x0, t_rec)
-        logits_rec = self.forward(x_rec, tau_rec)
-        recon_loss = F.cross_entropy(
-            logits_rec.view(-1, self.vocab_size),
-            x0.view(-1),
-            reduction="none",
-        ).view(B, -1)
-        self.log('recon_loss', recon_loss.mean(), prog_bar=True)
-
-        # Prior Loss
-        # t_prior = self._t_from_snr(torch.full((B,), SNR_MIN, device=self.device))  # Uniform SNR sampling
-        t_prior = self._t_from_logsnr(torch.full((B,), LOG_SNR_MIN, device=self.device))  # Uniform log-SNR sampling
-        prior_loss = self.prior_kl_linear_interp(target_data, t_min=t_prior)[:, None]
-        self.log('prior_loss', prior_loss.mean(), prog_bar=True)
-
-        loss = diff_loss + recon_loss + prior_loss
-        self.log('total_loss', loss.mean(), prog_bar=True)
-        return loss
-
-        # tau_t = self._sample_t_interval(B, current_accumulation_step,
-        #                             t_min=self.t_min, t_max=self.t_max)
-        # t = self._tau_to_t(tau_t)
+        # tau = self._t_to_tau(t)
         # x_t, target_data = self.corrupt_continuous(x0, t)
-        # f = self.forward(x_t, tau_t) #condition on tau_t
-        # # loss = -(target_data * f).sum(dim=-1)
-        # loss = 0.5 * ((target_data - f.exp())**2).sum(dim=-1)
-        # self.log('loss', loss.mean(), prog_bar=True)
-        # if self.config.algo.learnable_loss_weighting is True:
-        #     loss_weight = self.backbone.learnable_loss_weighting(tau_t)
-        #     loss_weight = loss_weight.unsqueeze(-1)
-        #     loss = torch.exp(-loss_weight) * loss + loss_weight
-        #     self.log('loss_weighted', loss.mean(), prog_bar=True)
-        # SNR_MAX = 15.
-        # snr_prime = 2*t / (1 - t)**3
-        # dtau_dt = self._d_tau_by_d_t(t)
-        # vlb_weight = snr_prime / dtau_dt
-        # self.log('vlb_weight', vlb_weight.mean(), prog_bar=True)
-        # self.log('snr_prime', snr_prime.mean(), prog_bar=True)
-        # self.log('dtau_dt', dtau_dt.mean(), prog_bar=True)
-        # return loss * vlb_weight[:, None]
-        # # return loss
+        # f = self.forward(x_t, tau) #condition on tau_t
+        # denoise_loss = ((target_data - f.exp())**2).sum(dim=-1)
+        # diff_loss = 0.5 * diff_loss_weight[:, None] * denoise_loss
+        # self.log('diff_loss', diff_loss.mean(), prog_bar=True)
+
+        # # Recon Loss
+        # # t_rec = self._t_from_snr(torch.full((B,), SNR_MAX, device=self.device))  # Uniform SNR sampling
+        # t_rec = self._t_from_logsnr(torch.full((B,), LOG_SNR_MAX, device=self.device))  # Uniform log-SNR sampling
+        # tau_rec = self._t_to_tau(t_rec)
+        # x_rec, _ = self.corrupt_continuous(x0, t_rec)
+        # logits_rec = self.forward(x_rec, tau_rec)
+        # recon_loss = F.cross_entropy(
+        #     logits_rec.view(-1, self.vocab_size),
+        #     x0.view(-1),
+        #     reduction="none",
+        # ).view(B, -1)
+        # self.log('recon_loss', recon_loss.mean(), prog_bar=True)
+
+        # # Prior Loss
+        # # t_prior = self._t_from_snr(torch.full((B,), SNR_MIN, device=self.device))  # Uniform SNR sampling
+        # t_prior = self._t_from_logsnr(torch.full((B,), LOG_SNR_MIN, device=self.device))  # Uniform log-SNR sampling
+        # prior_loss = self.prior_kl_linear_interp(target_data, t_min=t_prior)[:, None]
+        # self.log('prior_loss', prior_loss.mean(), prog_bar=True)
+
+        # loss = diff_loss + recon_loss + prior_loss
+        # self.log('total_loss', loss.mean(), prog_bar=True)
+        # return loss
+
+        tau_t = self._sample_t_interval(B, current_accumulation_step,
+                                    t_min=self.t_min, t_max=self.t_max)
+        t = self._tau_to_t(tau_t)
+        x_t, target_data = self.corrupt_continuous(x0, t)
+        f = self.forward(x_t, tau_t) #condition on tau_t
+        # loss = -(target_data * f).sum(dim=-1)
+        loss = 0.5 * ((target_data - f.exp())**2).sum(dim=-1)
+        self.log('loss', loss.mean(), prog_bar=True)
+        if self.config.algo.learnable_loss_weighting is True:
+            loss_weight = self.backbone.learnable_loss_weighting(tau_t)
+            loss_weight = loss_weight.unsqueeze(-1)
+            loss = torch.exp(-loss_weight) * loss + loss_weight
+            self.log('loss_weighted', loss.mean(), prog_bar=True)
+        snr_prime_t = 2*t / (1 - t)**3
+        dtau_dt = self._d_tau_by_d_t(t)
+        vlb_weight = snr_prime_t / dtau_dt
+        self.log('vlb_weight', vlb_weight.mean(), prog_bar=True)
+        self.log('snr_prime', snr_prime_t.mean(), prog_bar=True)
+        self.log('dtau_dt', dtau_dt.mean(), prog_bar=True)
+        return loss * vlb_weight[:, None]
+        # return loss
 
     @torch.no_grad()
     def generate_samples(self, num_samples, num_steps=None, eps=1e-5):

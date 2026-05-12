@@ -9,7 +9,7 @@ defaults:
   - /prior: none
   - /algo: flm
 
-mode: train  # train / ppl_eval / sample_eval
+mode: train  # train / ppl_eval / sample_eval / likelihood_eval / elbo_eval
 
 # di4c configs:
 is_di4c: False
@@ -69,6 +69,23 @@ eval:
   gen_ppl_eval_model_name_or_path: gpt2-large  # gpt2-large, meta-llama/Llama-2-7b-hf, meta-llama/Llama-3.1-8B
   generate_samples: True
   generated_samples_path: ${cwd:}/samples.json
+  likelihood_output_path: ${cwd:}/likelihood_eval.json
+  likelihood_num_steps: 128
+  likelihood_endpoint_eps: 1e-4
+  likelihood_trace_method: hutchinson
+  likelihood_trace_samples: 1
+  likelihood_solver: rk4
+  likelihood_noise: rademacher
+  likelihood_seed: ${seed}
+  elbo_output_path: ${cwd:}/elbo_eval.json
+  elbo_mc_samples: 4
+  elbo_num_steps: 512
+  elbo_endpoint_eps: 1e-2
+  elbo_trace_method: hutchinson
+  elbo_trace_samples: 4
+  elbo_solver: rk4
+  elbo_noise: rademacher
+  elbo_seed: ${seed}
 
 optim:
   weight_decay: 0
