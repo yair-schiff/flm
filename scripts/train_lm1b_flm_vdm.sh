@@ -7,8 +7,8 @@
 #SBATCH -t 960:00:00
 #SBATCH --partition=kuleshov,gpu
 #SBATCH --constraint="[h200|h100|a100|a6000|a5000]"
-#SBATCH --ntasks-per-node=8
-#SBATCH --gres=gpu:8
+#SBATCH --ntasks-per-node=4
+#SBATCH --gres=gpu:4
 #SBATCH --open-mode=append
 #SBATCH --requeue
 
@@ -42,6 +42,7 @@ VAL_TAU_MAX="${VAL_TAU_MAX:-$TAU_MAX}"
 LATENT_TYPE="${LATENT_TYPE:-vp}"
 COND_T="${COND_T:-gamma}"
 TRAIN_LOSS="${TRAIN_LOSS:-ce}"
+SOFTMAX_TEMPERATURE="${SOFTMAX_TEMPERATURE:-1.0}"
 TRAIN_ON_WEIGHTED_LOSS="${TRAIN_ON_WEIGHTED_LOSS:-True}"
 RECON_LOSS_ENABLED="${RECON_LOSS_ENABLED:-False}"
 TRAIN_ON_RECON_LOSS="${TRAIN_ON_RECON_LOSS:-False}"
@@ -119,6 +120,7 @@ torchrun --nnodes=$NUM_NODES --nproc_per_node=$NPROC --master_port=$MASTER_PORT 
   algo.latent_type=${LATENT_TYPE} \
   algo.cond_t=${COND_T} \
   algo.train_loss=${TRAIN_LOSS} \
+  algo.softmax_temperature=${SOFTMAX_TEMPERATURE} \
   algo.train_on_weighted_loss=${TRAIN_ON_WEIGHTED_LOSS} \
   algo.recon_loss_enabled=${RECON_LOSS_ENABLED} \
   algo.train_on_recon_loss=${TRAIN_ON_RECON_LOSS} \

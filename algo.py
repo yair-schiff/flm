@@ -1661,6 +1661,13 @@ class FLMVDM(FLM):
         self.latent_type = getattr(config.algo, 'latent_type', 'vp')
         self.cond_t = getattr(config.algo, 'cond_t', 'gamma')
         self.train_loss = getattr(config.algo, 'train_loss', 'ce')
+        self.softmax_temperature = getattr(
+            config.algo, 'softmax_temperature', 1.0)
+        if self.softmax_temperature is None:
+            self.softmax_temperature = 1.0
+        self.softmax_temperature = float(self.softmax_temperature)
+        if self.softmax_temperature <= 0.0:
+            raise ValueError("algo.softmax_temperature must be > 0")
         self.train_on_weighted_loss = getattr(config.algo, 'train_on_weighted_loss', False)
         self.train_on_recon_loss = bool(getattr(
             config.algo, 'train_on_recon_loss', False))
@@ -1734,6 +1741,14 @@ class FLMVDM(FLM):
         if not hasattr(self, 'noise_schedule'):
             return params
         return itertools.chain(params, self.noise_schedule.parameters())
+
+    def _process_model_output(self, model_output, xt, sigma, cap_value=30.0):
+        del xt, sigma
+        model_output = cap_value * torch.tanh(model_output / cap_value)
+        temperature = getattr(self, 'softmax_temperature', 1.0)
+        if temperature != 1.0:
+            model_output = model_output / temperature
+        return model_output.log_softmax(dim=-1)
     
     @property
     def _t_min(self):

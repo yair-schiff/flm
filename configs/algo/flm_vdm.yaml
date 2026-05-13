@@ -19,6 +19,7 @@ learnable_loss_weighting: False
 latent_type: vp  # vp, linear_interp
 cond_t: gamma  # tau, alpha, signal, gamma, log_nsr, nsr, log_snr, snr
 train_loss: ce  # ce, l2
+softmax_temperature: 1.0  # < 1 sharper, > 1 smoother output probabilities
 train_on_weighted_loss: False
 recon_loss_enabled: False
 train_on_recon_loss: False
