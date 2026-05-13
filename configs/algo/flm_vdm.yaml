@@ -29,12 +29,24 @@ prior_loss_weight: 1.0
 importance_sampling: ${training.importance_sampling}
 
 schedule:
-  type: linear  # linear, learned_vdm, argmax_uncertainty, snr_power
+  type: linear  # linear, linear_alpha, cosine_alpha, ode_alpha, piecewise_alpha, learned_vdm, argmax_uncertainty, snr_power
   gamma_min: -5.0
   gamma_max: 5.0
+  alpha_min: 0.0
+  alpha_max: 1.0
+  val_alpha_min: null
+  val_alpha_max: null
+  alpha_knots: null
+  tau_knots: null
+  tau_density: null
+  val_alpha_knots: null
+  val_tau_knots: null
+  val_tau_density: null
   C: 17.276323318481445
   p: 0.43169814348220825
   eps: 1e-6
   hidden_size: 1024
   n_points: 10000
   n_gh: 100
+  interpolation: pchip  # pchip, cubic
+  bisect_iters: 64

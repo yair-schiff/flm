@@ -5,7 +5,7 @@
 #SBATCH --get-user-env
 #SBATCH --mem=100000
 #SBATCH -t 960:00:00
-#SBATCH --partition=kuleshov
+#SBATCH --partition=kuleshov,gpu
 #SBATCH --constraint="[h200|h100|a100|a6000|a5000]"
 #SBATCH --ntasks-per-node=8
 #SBATCH --gres=gpu:8
@@ -19,7 +19,7 @@ export TORCHINDUCTOR_CACHE_DIR
 DATA_DIR="${DATA_DIR:-/share/kuleshov/yzs2/data}"
 REPO_ROOT="${FLM_REPO_ROOT:-/share/kuleshov/yzs2/flm-og}"
 
-SCHEDULE_TYPE="${SCHEDULE_TYPE:-argmax_uncertainty}"  # linear, learned_vdm, argmax_uncertainty, snr_power
+SCHEDULE_TYPE="${SCHEDULE_TYPE:-argmax_uncertainty}"  # linear, linear_alpha, cosine_alpha, ode_alpha, piecewise_alpha, learned_vdm, argmax_uncertainty, snr_power
 IMPORTANCE_SAMPLING="${IMPORTANCE_SAMPLING:-False}"
 RUN_NAME="${RUN_NAME:-lm1b_full_flm_vdm_${SCHEDULE_TYPE}}"
 
@@ -60,6 +60,18 @@ SCHEDULE_EPS="${SCHEDULE_EPS:-1e-6}"
 LEARNED_HIDDEN_SIZE="${LEARNED_HIDDEN_SIZE:-1024}"
 ARGMAX_N_POINTS="${ARGMAX_N_POINTS:-10000}"
 ARGMAX_N_GH="${ARGMAX_N_GH:-100}"
+ARGMAX_INTERPOLATION="${ARGMAX_INTERPOLATION:-pchip}"
+ODE_BISECT_ITERS="${ODE_BISECT_ITERS:-${BISECT_ITERS:-64}}"
+ALPHA_MIN="${ALPHA_MIN:-0.0}"
+ALPHA_MAX="${ALPHA_MAX:-1.0}"
+VAL_ALPHA_MIN="${VAL_ALPHA_MIN:-null}"
+VAL_ALPHA_MAX="${VAL_ALPHA_MAX:-null}"
+ALPHA_KNOTS="${ALPHA_KNOTS:-null}"
+TAU_KNOTS="${TAU_KNOTS:-null}"
+TAU_DENSITY="${TAU_DENSITY:-null}"
+VAL_ALPHA_KNOTS="${VAL_ALPHA_KNOTS:-null}"
+VAL_TAU_KNOTS="${VAL_TAU_KNOTS:-null}"
+VAL_TAU_DENSITY="${VAL_TAU_DENSITY:-null}"
 
 CHECKPOINT_EVERY_N_STEPS="${CHECKPOINT_EVERY_N_STEPS:-20000}"
 CHECKPOINT_MONITOR="${CHECKPOINT_MONITOR:-val_objective/${TRAIN_LOSS}_weighted}"
@@ -118,12 +130,24 @@ torchrun --nnodes=$NUM_NODES --nproc_per_node=$NPROC --master_port=$MASTER_PORT 
   algo.schedule.type=${SCHEDULE_TYPE} \
   algo.schedule.gamma_min=${GAMMA_MIN} \
   algo.schedule.gamma_max=${GAMMA_MAX} \
+  algo.schedule.alpha_min=${ALPHA_MIN} \
+  algo.schedule.alpha_max=${ALPHA_MAX} \
+  algo.schedule.val_alpha_min=${VAL_ALPHA_MIN} \
+  algo.schedule.val_alpha_max=${VAL_ALPHA_MAX} \
+  algo.schedule.alpha_knots="${ALPHA_KNOTS}" \
+  algo.schedule.tau_knots="${TAU_KNOTS}" \
+  algo.schedule.tau_density="${TAU_DENSITY}" \
+  algo.schedule.val_alpha_knots="${VAL_ALPHA_KNOTS}" \
+  algo.schedule.val_tau_knots="${VAL_TAU_KNOTS}" \
+  algo.schedule.val_tau_density="${VAL_TAU_DENSITY}" \
   algo.schedule.C=${SNR_POWER_C} \
   algo.schedule.p=${SNR_POWER_P} \
   algo.schedule.eps=${SCHEDULE_EPS} \
   algo.schedule.hidden_size=${LEARNED_HIDDEN_SIZE} \
   algo.schedule.n_points=${ARGMAX_N_POINTS} \
   algo.schedule.n_gh=${ARGMAX_N_GH} \
+  algo.schedule.interpolation=${ARGMAX_INTERPOLATION} \
+  algo.schedule.bisect_iters=${ODE_BISECT_ITERS} \
   callbacks.checkpoint_every_n_steps.every_n_train_steps=${CHECKPOINT_EVERY_N_STEPS} \
   callbacks.checkpoint_monitor.monitor="${CHECKPOINT_MONITOR}" \
   callbacks.checkpoint_monitor.filename="${CHECKPOINT_FILENAME}" \

@@ -1691,6 +1691,20 @@ class FLMVDM(FLM):
             vocab_size=self.vocab_size,
             gamma_min=self._schedule_get('gamma_min', None),
             gamma_max=self._schedule_get('gamma_max', None),
+            t_min=self._schedule_get('t_min', self.train_t_min),
+            t_max=self._schedule_get('t_max', self.train_t_max),
+            val_t_min=self._schedule_get('val_t_min', self.val_t_min),
+            val_t_max=self._schedule_get('val_t_max', self.val_t_max),
+            alpha_min=self._schedule_get('alpha_min', 0.0),
+            alpha_max=self._schedule_get('alpha_max', 1.0),
+            val_alpha_min=self._schedule_get('val_alpha_min', None),
+            val_alpha_max=self._schedule_get('val_alpha_max', None),
+            alpha_knots=self._schedule_get('alpha_knots', None),
+            tau_knots=self._schedule_get('tau_knots', None),
+            tau_density=self._schedule_get('tau_density', None),
+            val_alpha_knots=self._schedule_get('val_alpha_knots', None),
+            val_tau_knots=self._schedule_get('val_tau_knots', None),
+            val_tau_density=self._schedule_get('val_tau_density', None),
             C=self._schedule_get('C', self._schedule_get(
                 'c', 17.276323318481445)),
             p=self._schedule_get('p', 0.43169814348220825),
@@ -1698,6 +1712,9 @@ class FLMVDM(FLM):
             hidden_size=self._schedule_get('hidden_size', 1024),
             n_points=self._schedule_get('n_points', 10000),
             n_gh=self._schedule_get('n_gh', 100),
+            interpolation=self._schedule_get('interpolation', 'pchip'),
+            latent_type=self.latent_type,
+            bisect_iters=self._schedule_get('bisect_iters', 64),
         )
         if (self.ema is not None
                 and any(p.requires_grad
@@ -1824,12 +1841,12 @@ class FLMVDM(FLM):
         return loss
 
     def _l2_loss(self, target_data, log_softmax_pred, vlb_weight, stage):
-        loss = ((target_data - log_softmax_pred.exp()) ** 2).sum(dim=-1)
+        loss = 0.5 * ((target_data - log_softmax_pred.exp()) ** 2).sum(dim=-1)
         self._log_stage_metric(stage, 'l2_unweighted',
                                loss.mean().detach(),
                                group='objective')
         self._log_stage_metric(stage, 'l2_weighted',
-                               (0.5 * loss * vlb_weight).mean().detach(),
+                               (loss * vlb_weight).mean().detach(),
                                group='objective')
         return loss
 

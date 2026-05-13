@@ -19,7 +19,7 @@ MODEL_LENGTH="${MODEL_LENGTH:-128}"
 VAL_MC_SAMPLES="${VAL_MC_SAMPLES:-1}"
 DROP_LAST_VALID="${DROP_LAST_VALID:-False}"
 
-SCHEDULE_TYPE="${SCHEDULE_TYPE:-snr_power}"  # linear, learned_vdm, argmax_uncertainty, snr_power
+SCHEDULE_TYPE="${SCHEDULE_TYPE:-snr_power}"  # linear, linear_alpha, cosine_alpha, ode_alpha, piecewise_alpha, learned_vdm, argmax_uncertainty, snr_power
 RUN_NAME="${RUN_NAME:-lm1b_full_flm_vdm_${SCHEDULE_TYPE}}"
 CHECKPOINT_NAME="${CHECKPOINT_NAME:-best_ce_weighted.ckpt}"
 
@@ -48,6 +48,18 @@ SCHEDULE_EPS="${SCHEDULE_EPS:-1e-6}"
 LEARNED_HIDDEN_SIZE="${LEARNED_HIDDEN_SIZE:-1024}"
 ARGMAX_N_POINTS="${ARGMAX_N_POINTS:-10000}"
 ARGMAX_N_GH="${ARGMAX_N_GH:-100}"
+ARGMAX_INTERPOLATION="${ARGMAX_INTERPOLATION:-pchip}"
+ODE_BISECT_ITERS="${ODE_BISECT_ITERS:-${BISECT_ITERS:-64}}"
+ALPHA_MIN="${ALPHA_MIN:-0.0}"
+ALPHA_MAX="${ALPHA_MAX:-1.0}"
+VAL_ALPHA_MIN="${VAL_ALPHA_MIN:-null}"
+VAL_ALPHA_MAX="${VAL_ALPHA_MAX:-null}"
+ALPHA_KNOTS="${ALPHA_KNOTS:-null}"
+TAU_KNOTS="${TAU_KNOTS:-null}"
+TAU_DENSITY="${TAU_DENSITY:-null}"
+VAL_ALPHA_KNOTS="${VAL_ALPHA_KNOTS:-null}"
+VAL_TAU_KNOTS="${VAL_TAU_KNOTS:-null}"
+VAL_TAU_DENSITY="${VAL_TAU_DENSITY:-null}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -60,6 +72,7 @@ export HYDRA_FULL_ERROR=1
 
 python -u -m main \
   mode=ppl_eval \
+  loader.global_batch_size=${BATCH_SIZE} \
   loader.batch_size=${BATCH_SIZE} \
   loader.eval_batch_size=${BATCH_SIZE} \
   loader.num_workers=0 \
@@ -90,12 +103,24 @@ python -u -m main \
   algo.schedule.type=${SCHEDULE_TYPE} \
   algo.schedule.gamma_min=${GAMMA_MIN} \
   algo.schedule.gamma_max=${GAMMA_MAX} \
+  algo.schedule.alpha_min=${ALPHA_MIN} \
+  algo.schedule.alpha_max=${ALPHA_MAX} \
+  algo.schedule.val_alpha_min=${VAL_ALPHA_MIN} \
+  algo.schedule.val_alpha_max=${VAL_ALPHA_MAX} \
+  algo.schedule.alpha_knots="${ALPHA_KNOTS}" \
+  algo.schedule.tau_knots="${TAU_KNOTS}" \
+  algo.schedule.tau_density="${TAU_DENSITY}" \
+  algo.schedule.val_alpha_knots="${VAL_ALPHA_KNOTS}" \
+  algo.schedule.val_tau_knots="${VAL_TAU_KNOTS}" \
+  algo.schedule.val_tau_density="${VAL_TAU_DENSITY}" \
   algo.schedule.C=${SNR_POWER_C} \
   algo.schedule.p=${SNR_POWER_P} \
   algo.schedule.eps=${SCHEDULE_EPS} \
   algo.schedule.hidden_size=${LEARNED_HIDDEN_SIZE} \
   algo.schedule.n_points=${ARGMAX_N_POINTS} \
   algo.schedule.n_gh=${ARGMAX_N_GH} \
+  algo.schedule.interpolation=${ARGMAX_INTERPOLATION} \
+  algo.schedule.bisect_iters=${ODE_BISECT_ITERS} \
   eval.checkpoint_path=$checkpoint_path \
   trainer.limit_val_batches=$LIMIT_VAL_BATCHES \
   sampling.num_sample_batches=0 \
