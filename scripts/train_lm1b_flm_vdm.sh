@@ -7,8 +7,8 @@
 #SBATCH -t 960:00:00
 #SBATCH --partition=kuleshov,gpu
 #SBATCH --constraint="[h200|h100|a100|a6000|a5000]"
-#SBATCH --ntasks-per-node=4
-#SBATCH --gres=gpu:4
+#SBATCH --ntasks-per-node=8
+#SBATCH --gres=gpu:8
 #SBATCH --open-mode=append
 #SBATCH --requeue
 
@@ -39,13 +39,13 @@ TAU_MIN="${TAU_MIN:-0}"
 TAU_MAX="${TAU_MAX:-0.999}"
 VAL_TAU_MIN="${VAL_TAU_MIN:-$TAU_MIN}"
 VAL_TAU_MAX="${VAL_TAU_MAX:-$TAU_MAX}"
-LATENT_TYPE="${LATENT_TYPE:-vp}"
+LATENT_TYPE="${LATENT_TYPE:-linear_interp}"
 COND_T="${COND_T:-gamma}"
 TRAIN_LOSS="${TRAIN_LOSS:-ce}"
 SOFTMAX_TEMPERATURE="${SOFTMAX_TEMPERATURE:-1.0}"
 TRAIN_ON_WEIGHTED_LOSS="${TRAIN_ON_WEIGHTED_LOSS:-True}"
-RECON_LOSS_ENABLED="${RECON_LOSS_ENABLED:-False}"
-TRAIN_ON_RECON_LOSS="${TRAIN_ON_RECON_LOSS:-False}"
+RECON_LOSS_ENABLED="${RECON_LOSS_ENABLED:-True}"
+TRAIN_ON_RECON_LOSS="${TRAIN_ON_RECON_LOSS:-True}"
 RECON_LOSS_WEIGHT="${RECON_LOSS_WEIGHT:-1.0}"
 PRIOR_LOSS_ENABLED="${PRIOR_LOSS_ENABLED:-False}"
 TRAIN_ON_PRIOR_LOSS="${TRAIN_ON_PRIOR_LOSS:-False}"
@@ -100,6 +100,7 @@ torchrun --nnodes=$NUM_NODES --nproc_per_node=$NPROC --master_port=$MASTER_PORT 
   data=lm1b-wrap \
   data.cache_dir=$DATA_DIR \
   wandb.project=lm1b_full \
+  wandb.group=${RUN_NAME} \
   wandb.name=${RUN_NAME} \
   model=small \
   algo=flm_vdm \

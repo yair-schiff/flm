@@ -847,7 +847,7 @@ def _train(diffusion_model, config, logger, tokenizer):
         strategy=hydra.utils.instantiate(config.strategy),
         logger=wandb_logger)
     # Force weights_only=False to allow full checkpoint restore (PyTorch 2.6 defaults torch.load to weights_only=True)
-    trainer.fit(model, train_ds, valid_ds, ckpt_path=ckpt_path)
+    trainer.fit(model, train_ds, valid_ds, ckpt_path=ckpt_path, weights_only=False)
 
 
 @hydra.main(version_base=None, config_path='configs',
